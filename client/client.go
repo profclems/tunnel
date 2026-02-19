@@ -376,6 +376,11 @@ func (c *Client) handleTCPStream(bufferedReader io.Reader, remote net.Conn, loca
 	}
 	defer local.Close()
 
+	// Disable Nagle's algorithm for low-latency interactive sessions (SSH, etc.)
+	if tc, ok := local.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 

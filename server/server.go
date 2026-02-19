@@ -660,6 +660,11 @@ func (s *Server) handleTCPListener(l net.Listener, agent *AgentSession, port int
 }
 
 func (s *Server) proxyTCP(conn net.Conn, agent *AgentSession, port int) {
+	// Disable Nagle's algorithm for low-latency interactive sessions (SSH, etc.)
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
 	stream, err := agent.Session.Open()
 	if err != nil {
 		conn.Close()
