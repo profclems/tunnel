@@ -126,6 +126,10 @@ create_user() {
 create_dirs() {
     log "Creating directories..."
     mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+    # Config dir: root owns, tunnel group can read (for service to read config)
+    chown root:"$SERVICE_USER" "$CONFIG_DIR"
+    chmod 750 "$CONFIG_DIR"
+    # Data dir: tunnel owns (for service to write data)
     chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 }
 
@@ -246,7 +250,9 @@ rate_burst: 200
 EOF
     fi
 
-    chmod 600 "$CONFIG_FILE"
+    # Set ownership so tunnel user can read the config
+    chown root:"$SERVICE_USER" "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
 
     echo ""
     log "Config file created: $CONFIG_FILE"
