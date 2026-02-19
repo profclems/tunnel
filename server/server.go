@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -16,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/profclems/tunnel/protocol"
 	"github.com/hashicorp/yamux"
+	"github.com/profclems/tunnel/protocol"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -67,7 +68,6 @@ type Server struct {
 	mu sync.RWMutex
 
 	controlListener net.Listener
-	publicListener  net.Listener
 	tcpListeners    map[int]net.Listener // Active TCP listeners
 
 	startedAt   time.Time    // Server start time for uptime calculation
@@ -216,63 +216,133 @@ func (s *Server) listenHTTPS(ctx context.Context) error {
 	addr := fmt.Sprintf(":%d", s.config.TLSPort)
 	s.logger.Info("public https listening", "addr", addr)
 
-	tlsListener, err := tls.Listen("tcp", addr, m.TLSConfig())
-	if err != nil {
-		return fmt.Errorf("tls listener failed: %w", err)
+	// Use http.Server to handle HTTP/1.1 and HTTP/2 properly
+	server := &http.Server{
+		Addr:      addr,
+		Handler:   s.httpHandler("https"),
+		TLSConfig: m.TLSConfig(),
 	}
 
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		tlsListener.Close()
+		server.Shutdown(context.Background())
 	}()
 
-	for {
-		conn, err := tlsListener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				continue
-			}
-		}
-		go s.handlePublicConnectionWithProto(conn, "https")
+	err := server.ListenAndServeTLS("", "")
+	if err == http.ErrServerClosed {
+		return nil
 	}
+	return err
 }
 
 func (s *Server) listenHTTP(ctx context.Context) {
 	addr := fmt.Sprintf(":%d", s.config.PublicPort)
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		s.logger.Error("public http listener failed", "error", err)
-		return
-	}
-	s.publicListener = l
 	s.logger.Info("public http listening", "addr", addr)
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: s.httpHandler("http"),
+	}
 
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		l.Close()
+		server.Shutdown(context.Background())
 	}()
 
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			continue
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		s.logger.Error("public http listener failed", "error", err)
+	}
+}
+
+// httpHandler returns an http.Handler that forwards requests to tunnel agents
+func (s *Server) httpHandler(proto string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		// Remove port if present
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
 		}
 
-		// If TLS is enabled, we could redirect to HTTPS here.
-		// For now, we allow dual stack or just serve HTTP.
-		go s.handlePublicConnection(conn)
-	}
+		subdomain := strings.Split(host, ".")[0]
+
+		// Rate limiting
+		if s.rateLimiter != nil && !s.rateLimiter.Allow(subdomain) {
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		// Find the agent for this subdomain
+		s.mu.RLock()
+		agent, ok := s.httpRegistry[subdomain]
+		s.mu.RUnlock()
+
+		if !ok {
+			http.Error(w, "Tunnel not found", http.StatusNotFound)
+			return
+		}
+
+		if s.metrics != nil {
+			s.metrics.RecordRequest(subdomain)
+			s.metrics.RecordConnection(subdomain)
+		}
+
+		// Open a stream to the agent
+		stream, err := agent.Session.Open()
+		if err != nil {
+			s.logger.Error("failed to open stream to agent", "subdomain", subdomain, "error", err)
+			http.Error(w, "Agent unreachable", http.StatusBadGateway)
+			return
+		}
+		defer stream.Close()
+
+		// Send tunnel init message
+		initMsg := protocol.TunnelInit{Subdomain: subdomain}
+		if err := protocol.WriteMessage(stream, protocol.MsgTunnelInit, initMsg); err != nil {
+			s.logger.Error("failed to send tunnel init", "error", err)
+			http.Error(w, "Tunnel init failed", http.StatusBadGateway)
+			return
+		}
+
+		// Get client IP
+		clientIP := extractClientIP(r.RemoteAddr)
+
+		// Add proxy headers to the request
+		r.Header.Set("X-Forwarded-For", clientIP)
+		r.Header.Set("X-Forwarded-Proto", proto)
+		r.Header.Set("X-Real-IP", clientIP)
+		r.Header.Set("X-Tunnel-Subdomain", subdomain)
+
+		// Write the HTTP request to the agent stream
+		if err := r.Write(stream); err != nil {
+			s.logger.Error("failed to write request to agent", "error", err)
+			http.Error(w, "Failed to forward request", http.StatusBadGateway)
+			return
+		}
+
+		// Read the response from the agent
+		resp, err := http.ReadResponse(bufio.NewReader(stream), r)
+		if err != nil {
+			s.logger.Error("failed to read response from agent", "error", err)
+			http.Error(w, "Failed to read response", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Copy response headers
+		for key, values := range resp.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+
+		// Write status code
+		w.WriteHeader(resp.StatusCode)
+
+		// Copy response body
+		io.Copy(w, resp.Body)
+	})
 }
 
 // HealthResponse represents the health check response
@@ -553,91 +623,6 @@ func (s *Server) proxyTCP(conn net.Conn, agent *AgentSession, port int) {
 	conn.Close()
 }
 
-func (s *Server) handlePublicConnection(conn net.Conn) {
-	s.handlePublicConnectionWithProto(conn, "http")
-}
-
-func (s *Server) handlePublicConnectionWithProto(conn net.Conn, proto string) {
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		conn.Close()
-		return
-	}
-
-	conn.SetReadDeadline(time.Time{})
-
-	headerData := string(buf[:n])
-	host := extractHost(headerData)
-	if host == "" {
-		s.logger.Warn("could not extract host", "data_len", n)
-		conn.Close()
-		return
-	}
-
-	subdomain := strings.Split(host, ".")[0]
-
-	if s.rateLimiter != nil && !s.rateLimiter.Allow(subdomain) {
-		conn.Write([]byte("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n\r\nRate limit exceeded"))
-		conn.Close()
-		return
-	}
-
-	s.mu.RLock()
-	agent, ok := s.httpRegistry[subdomain]
-	s.mu.RUnlock()
-
-	if !ok {
-		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\nTunnel not found"))
-		conn.Close()
-		return
-	}
-
-	if s.metrics != nil {
-		s.metrics.RecordRequest(subdomain)
-		s.metrics.RecordConnection(subdomain)
-	}
-
-	stream, err := agent.Session.Open()
-	if err != nil {
-		s.logger.Error("failed to open stream to agent", "subdomain", subdomain, "error", err)
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\nAgent unreachable"))
-		conn.Close()
-		return
-	}
-
-	initMsg := protocol.TunnelInit{Subdomain: subdomain}
-	if err := protocol.WriteMessage(stream, protocol.MsgTunnelInit, initMsg); err != nil {
-		s.logger.Error("failed to send tunnel init", "error", err)
-		stream.Close()
-		conn.Close()
-		return
-	}
-
-	clientIP := extractClientIP(conn.RemoteAddr().String())
-	modifiedData := injectProxyHeaders(buf[:n], clientIP, proto, subdomain)
-	stream.Write(modifiedData)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		io.Copy(stream, conn) // Public -> Agent
-		stream.Close()
-	}()
-
-	go func() {
-		defer wg.Done()
-		io.Copy(conn, stream) // Agent -> Public
-		conn.Close()
-	}()
-
-	wg.Wait()
-}
-
 // extractClientIP extracts the IP address from a RemoteAddr string (ip:port)
 func extractClientIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
@@ -645,38 +630,6 @@ func extractClientIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
-}
-
-// injectProxyHeaders injects standard proxy headers into an HTTP request
-func injectProxyHeaders(data []byte, clientIP, proto, subdomain string) []byte {
-	headerData := string(data)
-
-	// Find the end of the first line (request line)
-	firstLineEnd := strings.Index(headerData, "\r\n")
-	if firstLineEnd == -1 {
-		return data // Not a valid HTTP request, return as-is
-	}
-
-	// Find the end of headers (empty line)
-	headersEnd := strings.Index(headerData, "\r\n\r\n")
-	if headersEnd == -1 {
-		headersEnd = len(headerData)
-	}
-
-	// Build new headers to inject
-	var newHeaders strings.Builder
-	newHeaders.WriteString(headerData[:firstLineEnd+2]) // Request line + CRLF
-
-	// Add proxy headers
-	newHeaders.WriteString(fmt.Sprintf("X-Forwarded-For: %s\r\n", clientIP))
-	newHeaders.WriteString(fmt.Sprintf("X-Forwarded-Proto: %s\r\n", proto))
-	newHeaders.WriteString(fmt.Sprintf("X-Real-IP: %s\r\n", clientIP))
-	newHeaders.WriteString(fmt.Sprintf("X-Tunnel-Subdomain: %s\r\n", subdomain))
-
-	// Append remaining headers and body
-	newHeaders.WriteString(headerData[firstLineEnd+2:])
-
-	return []byte(newHeaders.String())
 }
 
 func extractHost(header string) string {
