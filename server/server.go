@@ -193,11 +193,24 @@ func (s *Server) listenControl(ctx context.Context) {
 }
 
 func (s *Server) listenHTTPS(ctx context.Context) error {
+	// Custom host policy that allows the base domain and all subdomains
+	hostPolicy := func(ctx context.Context, host string) error {
+		// Allow exact match
+		if host == s.config.Domain {
+			return nil
+		}
+		// Allow subdomains (*.domain)
+		if strings.HasSuffix(host, "."+s.config.Domain) {
+			return nil
+		}
+		return fmt.Errorf("host %q not allowed", host)
+	}
+
 	m := &autocert.Manager{
 		Cache:      autocert.DirCache("certs"),
 		Prompt:     autocert.AcceptTOS,
 		Email:      s.config.TLSEmail,
-		HostPolicy: autocert.HostWhitelist(s.config.Domain, "*."+s.config.Domain),
+		HostPolicy: hostPolicy,
 	}
 
 	addr := fmt.Sprintf(":%d", s.config.TLSPort)
