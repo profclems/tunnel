@@ -445,6 +445,8 @@ func (s *Server) listenHealth(ctx context.Context) {
 func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.ConnectionWriteTimeout = 60 * time.Second  // Increase from 10s default
+	cfg.MaxStreamWindowSize = 1024 * 1024          // 1MB window (from 256KB)
 	session, err := yamux.Server(conn, cfg)
 	if err != nil {
 		s.logger.Error("yamux setup failed", "error", err)

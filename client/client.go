@@ -151,6 +151,8 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.ConnectionWriteTimeout = 60 * time.Second  // Increase from 10s default
+	cfg.MaxStreamWindowSize = 1024 * 1024          // 1MB window (from 256KB)
 	session, err := yamux.Client(conn, cfg)
 	if err != nil {
 		return fmt.Errorf("yamux setup failed: %w", err)
