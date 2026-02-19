@@ -208,14 +208,24 @@ func (s *Server) listenHTTPS(ctx context.Context) error {
 		return fmt.Errorf("tls listener failed: %w", err)
 	}
 
-	// We use the same handlePublicConnection logic, but wrapping the TLS conn
+	// Graceful shutdown
+	go func() {
+		<-ctx.Done()
+		tlsListener.Close()
+	}()
+
 	for {
 		conn, err := tlsListener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			continue
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				continue
+			}
 		}
 		go s.handlePublicConnectionWithProto(conn, "https")
 	}
