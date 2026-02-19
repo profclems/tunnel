@@ -353,24 +353,27 @@ func (s *Server) httpHandler(proto string) http.Handler {
 			flusher.Flush()
 		}
 
-		// Stream response body with periodic flushing for better responsiveness
-		buf := make([]byte, 32*1024)
-		for {
-			n, readErr := resp.Body.Read(buf)
-			if n > 0 {
-				_, writeErr := w.Write(buf[:n])
-				if writeErr != nil {
-					return
-				}
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			}
-			if readErr != nil {
-				break
-			}
+		// Stream response body with flushing for responsiveness
+		if flusher, ok := w.(http.Flusher); ok {
+			io.Copy(&flushWriter{w: w, f: flusher}, resp.Body)
+		} else {
+			io.Copy(w, resp.Body)
 		}
 	})
+}
+
+// flushWriter wraps a ResponseWriter and flushes after each write for streaming
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw *flushWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return
 }
 
 // HealthResponse represents the health check response
