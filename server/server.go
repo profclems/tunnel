@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -288,92 +290,118 @@ func (s *Server) httpHandler(proto string) http.Handler {
 			s.metrics.RecordConnection(subdomain)
 		}
 
-		// Open a stream to the agent
-		stream, err := agent.Session.Open()
-		if err != nil {
-			s.logger.Error("failed to open stream to agent", "subdomain", subdomain, "error", err)
-			http.Error(w, "Agent unreachable", http.StatusBadGateway)
-			return
-		}
-		defer stream.Close()
-
-		// Send tunnel init message
-		initMsg := protocol.TunnelInit{Subdomain: subdomain}
-		if err := protocol.WriteMessage(stream, protocol.MsgTunnelInit, initMsg); err != nil {
-			s.logger.Error("failed to send tunnel init", "error", err)
-			http.Error(w, "Tunnel init failed", http.StatusBadGateway)
-			return
-		}
-
-		// Get client IP
+		// Get client IP for proxy headers
 		clientIP := extractClientIP(r.RemoteAddr)
 
-		// Add proxy headers to the request
-		r.Header.Set("X-Forwarded-For", clientIP)
-		r.Header.Set("X-Forwarded-Proto", proto)
-		r.Header.Set("X-Real-IP", clientIP)
-		r.Header.Set("X-Tunnel-Subdomain", subdomain)
-
-		// Ensure RequestURI is set for HTTP/1.1 formatting
-		if r.URL.Scheme == "" {
-			r.URL.Scheme = proto
-		}
-		if r.URL.Host == "" {
-			r.URL.Host = r.Host
+		// Create a reverse proxy with a custom transport that uses yamux streams
+		target := &url.URL{
+			Scheme: "http",
+			Host:   "tunnel-agent", // Placeholder, we use custom transport
 		}
 
-		// Write the HTTP request to the agent stream
-		if err := r.Write(stream); err != nil {
-			s.logger.Error("failed to write request to agent", "error", err)
-			http.Error(w, "Failed to forward request", http.StatusBadGateway)
-			return
+		proxy := httputil.NewSingleHostReverseProxy(target)
+
+		// Custom transport that opens a yamux stream per request
+		proxy.Transport = &agentTransport{
+			agent:     agent,
+			subdomain: subdomain,
+			logger:    s.logger,
 		}
 
-		// Read the response from the agent
-		resp, err := http.ReadResponse(bufio.NewReader(stream), r)
-		if err != nil {
-			s.logger.Error("failed to read response from agent", "error", err)
-			http.Error(w, "Failed to read response", http.StatusBadGateway)
-			return
+		// Custom error handler
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			s.logger.Error("proxy error", "subdomain", subdomain, "error", err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		}
-		defer resp.Body.Close()
 
-		// Copy response headers
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
+		// Modify the request for forwarding
+		proxy.Director = func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = "tunnel-agent"
+
+			// Add proxy headers
+			req.Header.Set("X-Forwarded-For", clientIP)
+			req.Header.Set("X-Forwarded-Proto", proto)
+			req.Header.Set("X-Real-IP", clientIP)
+			req.Header.Set("X-Tunnel-Subdomain", subdomain)
+
+			// Preserve the original host header
+			if req.Header.Get("X-Forwarded-Host") == "" {
+				req.Header.Set("X-Forwarded-Host", req.Host)
 			}
 		}
 
-		// Write status code and flush headers
-		w.WriteHeader(resp.StatusCode)
+		// Enable streaming responses with flushing
+		proxy.FlushInterval = -1 // Flush immediately
 
-		// Flush headers immediately if possible
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-
-		// Stream response body with flushing for responsiveness
-		if flusher, ok := w.(http.Flusher); ok {
-			io.Copy(&flushWriter{w: w, f: flusher}, resp.Body)
-		} else {
-			io.Copy(w, resp.Body)
-		}
+		proxy.ServeHTTP(w, r)
 	})
 }
 
-// flushWriter wraps a ResponseWriter and flushes after each write for streaming
-type flushWriter struct {
-	w io.Writer
-	f http.Flusher
+// agentTransport implements http.RoundTripper to forward requests over yamux streams
+type agentTransport struct {
+	agent     *AgentSession
+	subdomain string
+	logger    *slog.Logger
 }
 
-func (fw *flushWriter) Write(p []byte) (n int, err error) {
-	n, err = fw.w.Write(p)
-	if fw.f != nil {
-		fw.f.Flush()
+func (t *agentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Open a new yamux stream for this request
+	stream, err := t.agent.Session.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
-	return
+
+	// Send tunnel init message to identify which tunnel this is for
+	initMsg := protocol.TunnelInit{Subdomain: t.subdomain}
+	if err := protocol.WriteMessage(stream, protocol.MsgTunnelInit, initMsg); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to send tunnel init: %w", err)
+	}
+
+	// Create an HTTP client connection over the yamux stream
+	// We use http.ReadResponse and req.Write but with proper lifecycle management
+	// The stream will be closed when the response body is closed
+
+	// Write the request
+	if err := req.Write(stream); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to write request: %w", err)
+	}
+
+	// Read the response
+	// Use a buffered reader for HTTP parsing
+	resp, err := http.ReadResponse(bufio.NewReader(stream), req)
+	if err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Wrap the response body to close the stream when done
+	// This is critical - the stream must stay open until the body is fully read
+	resp.Body = &streamClosingBody{
+		ReadCloser: resp.Body,
+		stream:     stream,
+	}
+
+	return resp, nil
+}
+
+// streamClosingBody wraps a response body to close the yamux stream when the body is closed
+type streamClosingBody struct {
+	io.ReadCloser
+	stream net.Conn
+}
+
+func (b *streamClosingBody) Close() error {
+	// Close the original body first
+	bodyErr := b.ReadCloser.Close()
+	// Then close the stream
+	streamErr := b.stream.Close()
+	if bodyErr != nil {
+		return bodyErr
+	}
+	return streamErr
 }
 
 // HealthResponse represents the health check response
@@ -445,8 +473,8 @@ func (s *Server) listenHealth(ctx context.Context) {
 func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 30 * time.Second
-	cfg.ConnectionWriteTimeout = 60 * time.Second  // Increase from 10s default
-	cfg.MaxStreamWindowSize = 1024 * 1024          // 1MB window (from 256KB)
+	cfg.ConnectionWriteTimeout = 60 * time.Second // Increase from 10s default
+	cfg.MaxStreamWindowSize = 1024 * 1024         // 1MB window (from 256KB)
 	session, err := yamux.Server(conn, cfg)
 	if err != nil {
 		s.logger.Error("yamux setup failed", "error", err)
@@ -663,16 +691,6 @@ func extractClientIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
-}
-
-func extractHost(header string) string {
-	lines := strings.Split(header, "\r\n")
-	for _, line := range lines {
-		if strings.HasPrefix(strings.ToLower(line), "host:") {
-			return strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "host:"))
-		}
-	}
-	return ""
 }
 
 // generateSubdomain creates a cryptographically random subdomain.

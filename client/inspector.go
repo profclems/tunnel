@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -91,157 +90,6 @@ func (i *Inspector) runSSEBroadcaster(ctx context.Context) {
 	}
 }
 
-// Inspect handles the proxying logic with inspection
-// Supports HTTP Keep-Alive by looping to handle multiple requests per connection
-func (i *Inspector) Inspect(remoteReader io.Reader, remoteWriter net.Conn, local net.Conn) {
-	// Wrap in bufio.Reader if not already (remoteReader may already be buffered)
-	br, ok := remoteReader.(*bufio.Reader)
-	if !ok {
-		br = bufio.NewReader(remoteReader)
-	}
-
-	localReader := bufio.NewReader(local)
-
-	// Loop to handle multiple requests on the same connection (HTTP Keep-Alive)
-	for {
-		if err := i.inspectSingleRequest(br, remoteWriter, local, localReader); err != nil {
-			// On error (connection closed, parsing error, etc.), exit the loop
-			return
-		}
-	}
-}
-
-// inspectSingleRequest handles a single HTTP request/response cycle
-// Returns an error if the connection should be closed
-func (i *Inspector) inspectSingleRequest(br *bufio.Reader, remoteWriter net.Conn, local net.Conn, localReader *bufio.Reader) error {
-	start := time.Now()
-	id := uuid.NewString()
-
-	// Read HTTP request from remote
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		if err == io.EOF {
-			return err // Clean connection close
-		}
-		// Fallback to raw pipe if not valid HTTP
-		go io.Copy(local, br)
-		io.Copy(remoteWriter, local)
-		return err
-	}
-
-	// Check for WebSocket upgrade - bypass HTTP parsing
-	if isWebSocketUpgrade(req) {
-		// Forward the request as-is and switch to raw pipe mode
-		if err := req.Write(local); err != nil {
-			return err
-		}
-		// Bidirectional raw pipe for WebSocket traffic
-		go io.Copy(local, br)
-		io.Copy(remoteWriter, localReader)
-		return io.EOF // Signal to exit the loop
-	}
-
-	// Capture Request Body (Limit to 1MB)
-	var reqBody string
-	if req.Body != nil {
-		limitReader := io.LimitReader(req.Body, 1024*1024) // 1MB
-		bodyBytes, _ := io.ReadAll(limitReader)
-		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore for forwarding
-		reqBody = string(bodyBytes)
-	}
-
-	// Build full URL for replay
-	urlStr := req.URL.String()
-	if req.URL.Host == "" && req.Host != "" {
-		urlStr = "http://" + req.Host + req.URL.RequestURI()
-	}
-
-	rec := &RequestRecord{
-		ID:        id,
-		Method:    req.Method,
-		Path:      req.URL.Path,
-		Host:      req.Host,
-		URL:       urlStr,
-		Timestamp: start,
-		ReqHeader: req.Header.Clone(),
-		ReqBody:   reqBody,
-	}
-
-	// Forward to Local
-	if err := req.Write(local); err != nil {
-		return err
-	}
-
-	// Read Response from Local
-	res, err := http.ReadResponse(localReader, req)
-	if err != nil {
-		return err
-	}
-
-	// Capture Response Body (Limit to 1MB)
-	var resBody string
-	if res.Body != nil {
-		limitReader := io.LimitReader(res.Body, 1024*1024)
-		bodyBytes, _ := io.ReadAll(limitReader)
-		res.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		resBody = string(bodyBytes)
-	}
-
-	rec.Status = res.StatusCode
-	rec.ResHeader = res.Header.Clone()
-	rec.ResBody = resBody
-	rec.Duration = time.Since(start).String()
-
-	// Save Record
-	i.addRecord(rec)
-
-	// Broadcast to SSE clients
-	select {
-	case i.broadcast <- rec:
-	default:
-		// Channel full, skip broadcast
-	}
-
-	// Forward Response to Remote
-	if err := res.Write(remoteWriter); err != nil {
-		return err
-	}
-
-	// Check if connection should be closed
-	if shouldCloseConnection(req, res) {
-		return io.EOF
-	}
-
-	return nil
-}
-
-// isWebSocketUpgrade checks if the request is a WebSocket upgrade request
-func isWebSocketUpgrade(req *http.Request) bool {
-	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
-}
-
-// shouldCloseConnection determines if the connection should be closed based on HTTP headers
-func shouldCloseConnection(req *http.Request, res *http.Response) bool {
-	// HTTP/1.0 defaults to close
-	if req.ProtoMajor == 1 && req.ProtoMinor == 0 {
-		// Unless Connection: keep-alive is explicitly set
-		if !strings.EqualFold(req.Header.Get("Connection"), "keep-alive") {
-			return true
-		}
-	}
-
-	// Check for Connection: close header in request or response
-	if strings.EqualFold(req.Header.Get("Connection"), "close") {
-		return true
-	}
-	if strings.EqualFold(res.Header.Get("Connection"), "close") {
-		return true
-	}
-
-	return false
-}
-
 func (i *Inspector) addRecord(rec *RequestRecord) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -277,6 +125,113 @@ func (i *Inspector) GetRequestByID(id string) *RequestRecord {
 // SetLocalAddr sets the local address for replay functionality
 func (i *Inspector) SetLocalAddr(addr string) {
 	i.localAddr = addr
+}
+
+// InspectHTTP handles an HTTP request with inspection, forwarding to local service
+// and writing the response back to the stream. This is the proper HTTP-aware version
+// that avoids the io.Copy goroutine race conditions.
+func (i *Inspector) InspectHTTP(req *http.Request, stream net.Conn, localAddr string) {
+	start := time.Now()
+	id := uuid.NewString()
+
+	// Capture Request Body (Limit to 1MB for recording)
+	var reqBody string
+	var reqBodyBytes []byte
+	if req.Body != nil {
+		limitReader := io.LimitReader(req.Body, 1024*1024)
+		reqBodyBytes, _ = io.ReadAll(limitReader)
+		req.Body = io.NopCloser(bytes.NewBuffer(reqBodyBytes)) // Restore for forwarding
+		reqBody = string(reqBodyBytes)
+	}
+
+	// Build full URL for replay
+	urlStr := req.URL.String()
+	if req.URL.Host == "" && req.Host != "" {
+		urlStr = "http://" + req.Host + req.URL.RequestURI()
+	}
+
+	rec := &RequestRecord{
+		ID:        id,
+		Method:    req.Method,
+		Path:      req.URL.Path,
+		Host:      req.Host,
+		URL:       urlStr,
+		Timestamp: start,
+		ReqHeader: req.Header.Clone(),
+		ReqBody:   reqBody,
+	}
+
+	// Modify request for forwarding to local service
+	req.URL.Scheme = "http"
+	req.URL.Host = localAddr
+	req.RequestURI = "" // Required for http.Client
+
+	// Create HTTP client for forwarding
+	transport := &http.Transport{
+		DisableCompression: true,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Forward request to local service
+	resp, err := client.Do(req)
+	if err != nil {
+		// Record error and send error response
+		rec.Status = http.StatusBadGateway
+		rec.Duration = time.Since(start).String()
+		i.addRecord(rec)
+
+		errorResp := &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("Local service unavailable")),
+		}
+		errorResp.Header.Set("Content-Type", "text/plain")
+		errorResp.Write(stream)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Capture Response Body (Limit to 1MB for recording)
+	// But we need to pass the full body through to the client
+	var resBody string
+	respBodyBytes, _ := io.ReadAll(resp.Body)
+	if len(respBodyBytes) <= 1024*1024 {
+		resBody = string(respBodyBytes)
+	} else {
+		resBody = string(respBodyBytes[:1024*1024]) + "... (truncated for display)"
+	}
+
+	// Restore body for writing to stream
+	resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+	resp.ContentLength = int64(len(respBodyBytes))
+
+	rec.Status = resp.StatusCode
+	rec.ResHeader = resp.Header.Clone()
+	rec.ResBody = resBody
+	rec.Duration = time.Since(start).String()
+
+	// Save Record
+	i.addRecord(rec)
+
+	// Broadcast to SSE clients
+	select {
+	case i.broadcast <- rec:
+	default:
+	}
+
+	// Write response back to the stream
+	resp.Write(stream)
 }
 
 // ReplayResult holds the result of a replayed request

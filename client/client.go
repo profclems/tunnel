@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,12 +11,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/profclems/tunnel/protocol"
 	"github.com/hashicorp/yamux"
+	"github.com/profclems/tunnel/protocol"
 )
 
 // TunnelConfig defines a single tunnel
@@ -151,8 +154,8 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	cfg := yamux.DefaultConfig()
 	cfg.KeepAliveInterval = 30 * time.Second
-	cfg.ConnectionWriteTimeout = 60 * time.Second  // Increase from 10s default
-	cfg.MaxStreamWindowSize = 1024 * 1024          // 1MB window (from 256KB)
+	cfg.ConnectionWriteTimeout = 60 * time.Second // Increase from 10s default
+	cfg.MaxStreamWindowSize = 1024 * 1024         // 1MB window (from 256KB)
 	session, err := yamux.Client(conn, cfg)
 	if err != nil {
 		return fmt.Errorf("yamux setup failed: %w", err)
@@ -274,14 +277,89 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 		return
 	}
 
-	if c.config.Inspect && target.Type == "http" {
-		c.handleInspectedStream(bufferedReader, remote, target.LocalAddr)
+	// Handle based on tunnel type
+	if target.Type == "http" {
+		if c.config.Inspect {
+			c.handleInspectedStream(bufferedReader, remote, target.LocalAddr)
+		} else {
+			c.handleHTTPStream(bufferedReader, remote, target.LocalAddr)
+		}
+	} else {
+		c.handleTCPStream(bufferedReader, remote, target.LocalAddr)
+	}
+}
+
+// handleHTTPStream handles HTTP tunnel traffic using proper HTTP client/response lifecycle.
+// This avoids the io.Copy goroutine race conditions that caused file truncation.
+func (c *Client) handleHTTPStream(bufferedReader io.Reader, remote net.Conn, localAddr string) {
+	defer remote.Close()
+
+	// Read the incoming HTTP request from the server
+	req, err := http.ReadRequest(bufio.NewReader(bufferedReader))
+	if err != nil {
+		c.logger.Error("failed to read HTTP request", "error", err)
+		c.writeErrorResponse(remote, http.StatusBadGateway, "Failed to read request")
 		return
 	}
 
+	// Modify request for forwarding to local service
+	req.URL.Scheme = "http"
+	req.URL.Host = localAddr
+	req.RequestURI = "" // Required for http.Client
+
+	// Create HTTP client for forwarding
+	// Use a transport with proper connection handling
+	transport := &http.Transport{
+		DisableCompression: true, // Preserve original encoding
+		// Don't limit idle connections since each request uses a new stream
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0, // No timeout - let yamux handle it
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects, pass them through
+		},
+	}
+
+	// Forward request to local service
+	resp, err := client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to forward request to local service", "error", err, "addr", localAddr)
+		c.writeErrorResponse(remote, http.StatusBadGateway, "Local service unavailable")
+		return
+	}
+	defer resp.Body.Close()
+
+	// Write response back to the yamux stream
+	// This properly handles Content-Length, chunked encoding, and body streaming
+	if err := resp.Write(remote); err != nil {
+		c.logger.Error("failed to write response to tunnel", "error", err)
+	}
+}
+
+// writeErrorResponse writes an HTTP error response to the stream
+func (c *Client) writeErrorResponse(w io.Writer, statusCode int, message string) {
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(message)),
+	}
+	resp.Header.Set("Content-Type", "text/plain")
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(message)))
+	resp.Write(w)
+}
+
+// handleTCPStream handles raw TCP tunnel traffic using bidirectional copy.
+// TCP tunnels don't have HTTP semantics so manual io.Copy is appropriate.
+func (c *Client) handleTCPStream(bufferedReader io.Reader, remote net.Conn, localAddr string) {
 	defer remote.Close()
 
-	local, err := net.Dial("tcp", target.LocalAddr)
+	local, err := net.Dial("tcp", localAddr)
 	if err != nil {
 		c.logger.Error("failed to dial local service", "error", err)
 		return
@@ -294,8 +372,8 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 	go func() {
 		defer wg.Done()
 		io.Copy(local, bufferedReader)
-		if c, ok := local.(*net.TCPConn); ok {
-			c.CloseWrite()
+		if tc, ok := local.(*net.TCPConn); ok {
+			tc.CloseWrite()
 		}
 	}()
 
@@ -312,13 +390,14 @@ func (c *Client) handleInspectedStream(bufferedReader io.Reader, remote net.Conn
 
 	c.inspector.SetLocalAddr(localAddr)
 
-	local, err := net.Dial("tcp", localAddr)
+	// Read the incoming HTTP request
+	req, err := http.ReadRequest(bufio.NewReader(bufferedReader))
 	if err != nil {
-		c.logger.Error("failed to dial local service", "error", err)
+		c.logger.Error("failed to read HTTP request for inspection", "error", err)
+		c.writeErrorResponse(remote, http.StatusBadGateway, "Failed to read request")
 		return
 	}
-	defer local.Close()
 
-	// Use Inspector to proxy
-	c.inspector.Inspect(bufferedReader, remote, local)
+	// Use Inspector to handle request/response with recording
+	c.inspector.InspectHTTP(req, remote, localAddr)
 }
