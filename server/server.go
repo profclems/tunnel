@@ -314,6 +314,14 @@ func (s *Server) httpHandler(proto string) http.Handler {
 		r.Header.Set("X-Real-IP", clientIP)
 		r.Header.Set("X-Tunnel-Subdomain", subdomain)
 
+		// Ensure RequestURI is set for HTTP/1.1 formatting
+		if r.URL.Scheme == "" {
+			r.URL.Scheme = proto
+		}
+		if r.URL.Host == "" {
+			r.URL.Host = r.Host
+		}
+
 		// Write the HTTP request to the agent stream
 		if err := r.Write(stream); err != nil {
 			s.logger.Error("failed to write request to agent", "error", err)
@@ -337,11 +345,31 @@ func (s *Server) httpHandler(proto string) http.Handler {
 			}
 		}
 
-		// Write status code
+		// Write status code and flush headers
 		w.WriteHeader(resp.StatusCode)
 
-		// Copy response body
-		io.Copy(w, resp.Body)
+		// Flush headers immediately if possible
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		// Stream response body with periodic flushing for better responsiveness
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				_, writeErr := w.Write(buf[:n])
+				if writeErr != nil {
+					return
+				}
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
 	})
 }
 
