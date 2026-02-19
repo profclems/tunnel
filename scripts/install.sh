@@ -138,15 +138,16 @@ setup_mtls() {
     CERTS_DIR="${CONFIG_DIR}/certs"
     mkdir -p "$CERTS_DIR"
 
-    log "Initializing CA for mTLS..."
-    "${INSTALL_DIR}/${BINARY_NAME}" cert init --out "$CERTS_DIR" --days 365
+    log "Initializing CA and server certificate for mTLS..."
+    "${INSTALL_DIR}/${BINARY_NAME}" cert init --out "$CERTS_DIR" --days 365 --domain "$DOMAIN"
 
     chown -R "$SERVICE_USER:$SERVICE_USER" "$CERTS_DIR"
     chmod 700 "$CERTS_DIR"
     chmod 600 "$CERTS_DIR/ca.key"
+    chmod 600 "$CERTS_DIR/server.key"
 
     echo ""
-    log "mTLS CA initialized in $CERTS_DIR"
+    log "mTLS initialized in $CERTS_DIR"
     echo ""
 }
 

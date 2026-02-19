@@ -32,6 +32,7 @@ func newCertInitCmd() *cobra.Command {
 	var (
 		outDir   string
 		validFor int
+		domain   string
 	)
 
 	cmd := &cobra.Command{
@@ -46,7 +47,7 @@ This creates:
   - server.key: Server private key
 
 Example:
-  tunnel cert init --out /etc/tunnel/certs`,
+  tunnel cert init --out /etc/tunnel/certs --domain px.example.com`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := os.MkdirAll(outDir, 0700); err != nil {
 				return fmt.Errorf("failed to create output directory: %w", err)
@@ -121,12 +122,19 @@ Example:
 				return fmt.Errorf("failed to generate server serial number: %w", err)
 			}
 
+			// Build DNS names for server certificate
+			dnsNames := []string{"localhost"}
+			if domain != "" {
+				dnsNames = append(dnsNames, domain)
+			}
+
 			serverTemplate := x509.Certificate{
 				SerialNumber: serverSerial,
 				Subject: pkix.Name{
 					CommonName:   "Tunnel Server",
 					Organization: []string{"Tunnel"},
 				},
+				DNSNames:    dnsNames,
 				NotBefore:   time.Now(),
 				NotAfter:    time.Now().AddDate(0, 0, validFor),
 				KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -195,6 +203,7 @@ Example:
 
 	cmd.Flags().StringVarP(&outDir, "out", "o", ".", "Output directory for CA files")
 	cmd.Flags().IntVar(&validFor, "days", 365, "CA validity period in days")
+	cmd.Flags().StringVar(&domain, "domain", "", "Server domain name for certificate SAN (e.g., px.example.com)")
 
 	return cmd
 }
