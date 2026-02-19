@@ -227,6 +227,8 @@ rate_burst: 200
 
 # mTLS - require client certificates
 agent_ca: "${CONFIG_DIR}/certs/ca.crt"
+agent_cert: "${CONFIG_DIR}/certs/server.crt"
+agent_key: "${CONFIG_DIR}/certs/server.key"
 require_agent_cert: true
 EOF
     else

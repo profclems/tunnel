@@ -36,12 +36,14 @@ func newCertInitCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Initialize CA certificate and key",
-		Long: `Generate a new Certificate Authority (CA) for signing client certificates.
+		Short: "Initialize CA and server certificates",
+		Long: `Generate a new Certificate Authority (CA) and server certificate for mTLS.
 
 This creates:
   - ca.crt: CA certificate (distribute to clients for verification)
-  - ca.key: CA private key (keep secret, used to sign client certs)
+  - ca.key: CA private key (keep secret, used to sign certs)
+  - server.crt: Server certificate (for TLS on control port)
+  - server.key: Server private key
 
 Example:
   tunnel cert init --out /etc/tunnel/certs`,
@@ -108,13 +110,84 @@ Example:
 				return fmt.Errorf("failed to write CA key: %w", err)
 			}
 
-			fmt.Printf("CA initialized successfully:\n")
+			// Now generate server certificate
+			serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				return fmt.Errorf("failed to generate server key: %w", err)
+			}
+
+			serverSerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+			if err != nil {
+				return fmt.Errorf("failed to generate server serial number: %w", err)
+			}
+
+			serverTemplate := x509.Certificate{
+				SerialNumber: serverSerial,
+				Subject: pkix.Name{
+					CommonName:   "Tunnel Server",
+					Organization: []string{"Tunnel"},
+				},
+				NotBefore:   time.Now(),
+				NotAfter:    time.Now().AddDate(0, 0, validFor),
+				KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+				ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			}
+
+			// Parse CA cert for signing
+			caCertParsed, err := x509.ParseCertificate(caCertDER)
+			if err != nil {
+				return fmt.Errorf("failed to parse CA cert: %w", err)
+			}
+
+			serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, caCertParsed, &serverKey.PublicKey, caKey)
+			if err != nil {
+				return fmt.Errorf("failed to create server certificate: %w", err)
+			}
+
+			// Write server cert
+			serverCertPath := filepath.Join(outDir, "server.crt")
+			serverCertFile, err := os.OpenFile(serverCertPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				return fmt.Errorf("failed to create server cert file: %w", err)
+			}
+			defer serverCertFile.Close()
+
+			if err := pem.Encode(serverCertFile, &pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER}); err != nil {
+				return fmt.Errorf("failed to write server cert: %w", err)
+			}
+
+			// Write server key
+			serverKeyPath := filepath.Join(outDir, "server.key")
+			serverKeyFile, err := os.OpenFile(serverKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			if err != nil {
+				return fmt.Errorf("failed to create server key file: %w", err)
+			}
+			defer serverKeyFile.Close()
+
+			serverKeyDER, err := x509.MarshalECPrivateKey(serverKey)
+			if err != nil {
+				return fmt.Errorf("failed to marshal server key: %w", err)
+			}
+
+			if err := pem.Encode(serverKeyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: serverKeyDER}); err != nil {
+				return fmt.Errorf("failed to write server key: %w", err)
+			}
+
+			fmt.Printf("mTLS initialized successfully:\n")
+			fmt.Printf("\nCA:\n")
 			fmt.Printf("  Certificate: %s\n", caCertPath)
 			fmt.Printf("  Private Key: %s (keep secret!)\n", caKeyPath)
-			fmt.Printf("  Valid for:   %d days\n", validFor)
-			fmt.Printf("\nNext steps:\n")
-			fmt.Printf("  1. Configure server: --agent-ca %s\n", caCertPath)
-			fmt.Printf("  2. Issue client certs: tunnel cert issue --name client1 --ca-cert %s --ca-key %s\n", caCertPath, caKeyPath)
+			fmt.Printf("\nServer:\n")
+			fmt.Printf("  Certificate: %s\n", serverCertPath)
+			fmt.Printf("  Private Key: %s\n", serverKeyPath)
+			fmt.Printf("\nValid for: %d days\n", validFor)
+			fmt.Printf("\nServer config:\n")
+			fmt.Printf("  agent_ca: %s\n", caCertPath)
+			fmt.Printf("  agent_cert: %s\n", serverCertPath)
+			fmt.Printf("  agent_key: %s\n", serverKeyPath)
+			fmt.Printf("  require_agent_cert: true\n")
+			fmt.Printf("\nIssue client certs:\n")
+			fmt.Printf("  tunnel cert issue --name client1 --ca-cert %s --ca-key %s\n", caCertPath, caKeyPath)
 
 			return nil
 		},
