@@ -311,3 +311,51 @@ func TestClient_CreateTLSConfig_InvalidCAFile(t *testing.T) {
 		t.Error("expected error for nonexistent CA file")
 	}
 }
+
+func TestExtractSubdomainFromURL(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{
+			name: "https with subdomain",
+			url:  "https://abc123.example.com",
+			want: "abc123",
+		},
+		{
+			name: "http with subdomain",
+			url:  "http://myapp.localhost",
+			want: "myapp",
+		},
+		{
+			name: "https with nested domain",
+			url:  "https://test.px.csam.dev",
+			want: "test",
+		},
+		{
+			name: "with path",
+			url:  "https://app.example.com/some/path",
+			want: "app",
+		},
+		{
+			name: "no subdomain (bare domain)",
+			url:  "https://localhost",
+			want: "",
+		},
+		{
+			name: "empty url",
+			url:  "",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractSubdomainFromURL(tt.url)
+			if got != tt.want {
+				t.Errorf("extractSubdomainFromURL(%q) = %q, want %q", tt.url, got, tt.want)
+			}
+		})
+	}
+}

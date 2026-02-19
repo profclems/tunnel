@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -203,8 +204,17 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return fmt.Errorf("server rejected auth: %s", resp.Error)
 	}
 
-	for _, url := range resp.URLs {
+	// Update tunnel configs with assigned subdomains from server
+	// Server returns URLs in the same order as tunnel requests
+	for i, url := range resp.URLs {
 		c.logger.Info("tunnel established", "url", url)
+
+		// For HTTP tunnels without explicit subdomain, extract the assigned one
+		if i < len(c.config.Tunnels) && c.config.Tunnels[i].Type == "http" && c.config.Tunnels[i].Subdomain == "" {
+			if subdomain := extractSubdomainFromURL(url); subdomain != "" {
+				c.config.Tunnels[i].Subdomain = subdomain
+			}
+		}
 	}
 
 	go func() {
@@ -400,4 +410,24 @@ func (c *Client) handleInspectedStream(bufferedReader io.Reader, remote net.Conn
 
 	// Use Inspector to handle request/response with recording
 	c.inspector.InspectHTTP(req, remote, localAddr)
+}
+
+// extractSubdomainFromURL extracts the subdomain from a tunnel URL.
+// For "https://abc123.example.com" returns "abc123".
+func extractSubdomainFromURL(rawURL string) string {
+	// Remove leading scheme if missing for url.Parse
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "http://" + rawURL
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+
+	hostname := parsed.Hostname()
+	if idx := strings.Index(hostname, "."); idx != -1 {
+		return hostname[:idx]
+	}
+	return ""
 }
