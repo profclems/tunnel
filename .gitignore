@@ -1,0 +1,37 @@
+# Binaries
+tunnel
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Certificates (don't commit secrets)
+*.pem
+*.key
+*.crt
+*.csr
+certs/
+
+# Config files with secrets
+tunnel.yaml
+tunnel.yml
