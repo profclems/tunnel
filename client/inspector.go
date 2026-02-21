@@ -1659,6 +1659,83 @@ const dashboardHTML = `
             cursor: not-allowed;
         }
 
+        .export-dropdown {
+            position: relative;
+            display: inline-block;
+        }
+
+        .btn-export {
+            background: var(--bg-tertiary);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            padding: 5px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+
+        .btn-export:hover {
+            background: var(--border);
+        }
+
+        .export-menu {
+            display: none;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 4px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            min-width: 140px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            z-index: 100;
+        }
+
+        .export-menu.visible {
+            display: block;
+        }
+
+        .export-option {
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.1s;
+        }
+
+        .export-option:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .export-option:first-child {
+            border-radius: 6px 6px 0 0;
+        }
+
+        .export-option:last-child {
+            border-radius: 0 0 6px 6px;
+        }
+
+        .copy-toast {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--success);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 1000;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .copy-toast.visible {
+            opacity: 1;
+        }
+
         .replay-result {
             margin-top: 12px;
             padding: 10px 12px;
@@ -1681,6 +1758,199 @@ const dashboardHTML = `
             background: rgba(248, 81, 73, 0.1);
             border: 1px solid rgba(248, 81, 73, 0.3);
             color: var(--error);
+        }
+
+        /* ===== DIFF COMPARISON ===== */
+        .diff-checkbox {
+            width: 14px;
+            height: 14px;
+            cursor: pointer;
+            accent-color: var(--primary);
+            flex-shrink: 0;
+        }
+
+        .diff-checkbox:checked + .req-status-dot {
+            margin-left: 0;
+        }
+
+        .compare-bar {
+            padding: 8px 16px;
+            background: rgba(88, 166, 255, 0.1);
+            border-bottom: 1px solid var(--primary);
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 12px;
+        }
+
+        .compare-bar.visible {
+            display: flex;
+        }
+
+        .compare-bar-info {
+            color: var(--text-secondary);
+        }
+
+        .compare-bar-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn-compare {
+            padding: 4px 12px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .btn-compare:hover {
+            background: #4a9eff;
+        }
+
+        .btn-clear-compare {
+            padding: 4px 12px;
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+
+        .btn-clear-compare:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .diff-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .diff-modal.visible {
+            display: flex;
+        }
+
+        .diff-modal-content {
+            background: var(--bg-main);
+            border-radius: 8px;
+            width: 95%;
+            max-width: 1400px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid var(--border);
+        }
+
+        .diff-modal-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .diff-modal-title {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .diff-modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 20px;
+            padding: 4px 8px;
+        }
+
+        .diff-modal-close:hover {
+            color: var(--text-main);
+        }
+
+        .diff-tabs {
+            display: flex;
+            gap: 0;
+            padding: 0 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .diff-tab {
+            padding: 10px 16px;
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--text-muted);
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+
+        .diff-tab:hover {
+            color: var(--text-main);
+        }
+
+        .diff-tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        .diff-body {
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+        }
+
+        .diff-pane {
+            flex: 1;
+            overflow: auto;
+            padding: 16px;
+        }
+
+        .diff-pane:first-child {
+            border-right: 1px solid var(--border);
+        }
+
+        .diff-pane-header {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .diff-line {
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            padding: 2px 8px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .diff-line.added {
+            background: rgba(63, 185, 80, 0.15);
+            color: var(--success);
+        }
+
+        .diff-line.removed {
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--error);
+        }
+
+        .diff-line.unchanged {
+            color: var(--text-secondary);
         }
 
         .detail-content {
@@ -2096,6 +2366,15 @@ const dashboardHTML = `
             </select>
         </div>
 
+        <!-- Compare Bar -->
+        <div id="compare-bar" class="compare-bar">
+            <span class="compare-bar-info"><span id="compare-count">0</span> requests selected for comparison</span>
+            <div class="compare-bar-actions">
+                <button class="btn-clear-compare" onclick="clearDiffSelection()">Clear</button>
+                <button class="btn-compare" id="btn-compare" onclick="showDiffModal()">Compare</button>
+            </div>
+        </div>
+
         <div id="req-list" class="req-list"></div>
     </div>
 
@@ -2179,6 +2458,13 @@ const dashboardHTML = `
                     <span id="d-time">12:00:00</span>
                     <span id="d-duration">120ms</span>
                     <button id="btn-replay" class="btn-replay" onclick="replayRequest()">▶ Replay</button>
+                    <div class="export-dropdown">
+                        <button class="btn-export" onclick="toggleExportMenu()">⤓ Export</button>
+                        <div class="export-menu" id="export-menu">
+                            <div class="export-option" onclick="copyAsCurl()">Copy as cURL</div>
+                            <div class="export-option" onclick="copyAsFetch()">Copy as fetch</div>
+                        </div>
+                    </div>
                 </div>
                 <div id="replay-result" class="replay-result"></div>
             </div>
@@ -2215,6 +2501,31 @@ const dashboardHTML = `
         </div>
     </div>
 
+    <!-- Diff Modal -->
+    <div id="diff-modal" class="diff-modal" onclick="closeDiffModal(event)">
+        <div class="diff-modal-content" onclick="event.stopPropagation()">
+            <div class="diff-modal-header">
+                <span class="diff-modal-title">Request Comparison</span>
+                <button class="diff-modal-close" onclick="closeDiffModal()">&times;</button>
+            </div>
+            <div class="diff-tabs">
+                <div class="diff-tab active" data-diff-tab="url" onclick="switchDiffTab('url')">URL & Method</div>
+                <div class="diff-tab" data-diff-tab="headers" onclick="switchDiffTab('headers')">Headers</div>
+                <div class="diff-tab" data-diff-tab="body" onclick="switchDiffTab('body')">Body</div>
+            </div>
+            <div class="diff-body">
+                <div class="diff-pane">
+                    <div class="diff-pane-header" id="diff-left-header">Request 1</div>
+                    <div id="diff-left-content"></div>
+                </div>
+                <div class="diff-pane">
+                    <div class="diff-pane-header" id="diff-right-header">Request 2</div>
+                    <div id="diff-right-content"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let tunnelsList = [];
@@ -2228,6 +2539,8 @@ const dashboardHTML = `
         let sseConnected = false;
         let metricsCollapsed = false;
         let metricsData = null;
+        let selectedForDiff = [];
+        let currentDiffTab = 'url';
 
         // ===== METRICS =====
 
@@ -2374,6 +2687,281 @@ const dashboardHTML = `
                 return highlightJSON(body);
             }
             return escapeHtml(body);
+        }
+
+        // ===== EXPORT FUNCTIONS =====
+
+        function toggleExportMenu() {
+            const menu = document.getElementById('export-menu');
+            menu.classList.toggle('visible');
+
+            // Close menu when clicking outside
+            if (menu.classList.contains('visible')) {
+                setTimeout(() => {
+                    document.addEventListener('click', closeExportMenu);
+                }, 0);
+            }
+        }
+
+        function closeExportMenu(e) {
+            const menu = document.getElementById('export-menu');
+            const dropdown = e.target.closest('.export-dropdown');
+            if (!dropdown) {
+                menu.classList.remove('visible');
+                document.removeEventListener('click', closeExportMenu);
+            }
+        }
+
+        function generateCurl(r) {
+            let cmd = 'curl';
+
+            // Method
+            if (r.method !== 'GET') {
+                cmd += ' -X ' + r.method;
+            }
+
+            // Headers
+            if (r.req_header) {
+                for (const [key, values] of Object.entries(r.req_header)) {
+                    if (key.toLowerCase() === 'host') continue;
+                    const val = Array.isArray(values) ? values[0] : values;
+                    cmd += " \\\n  -H '" + key + ': ' + val.replace(/'/g, "'\\''") + "'";
+                }
+            }
+
+            // Body
+            if (r.req_body) {
+                cmd += " \\\n  -d '" + r.req_body.replace(/'/g, "'\\''") + "'";
+            }
+
+            // URL
+            cmd += " \\\n  '" + r.url + "'";
+
+            return cmd;
+        }
+
+        function generateFetch(r) {
+            const options = {
+                method: r.method
+            };
+
+            // Headers
+            if (r.req_header) {
+                options.headers = {};
+                for (const [key, values] of Object.entries(r.req_header)) {
+                    if (key.toLowerCase() === 'host') continue;
+                    options.headers[key] = Array.isArray(values) ? values[0] : values;
+                }
+            }
+
+            // Body
+            if (r.req_body) {
+                options.body = r.req_body;
+            }
+
+            return "fetch('" + r.url + "', " + JSON.stringify(options, null, 2) + ")\n  .then(res => res.json())\n  .then(console.log)\n  .catch(console.error);";
+        }
+
+        function copyAsCurl() {
+            if (!selectedId) return;
+            const r = requestsMap[selectedId];
+            if (!r) return;
+
+            const curl = generateCurl(r);
+            copyToClipboard(curl);
+            document.getElementById('export-menu').classList.remove('visible');
+        }
+
+        function copyAsFetch() {
+            if (!selectedId) return;
+            const r = requestsMap[selectedId];
+            if (!r) return;
+
+            const fetchCode = generateFetch(r);
+            copyToClipboard(fetchCode);
+            document.getElementById('export-menu').classList.remove('visible');
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showCopyToast('Copied to clipboard!');
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
+        }
+
+        function showCopyToast(message) {
+            let toast = document.getElementById('copy-toast');
+            if (!toast) {
+                toast = document.createElement('div');
+                toast.id = 'copy-toast';
+                toast.className = 'copy-toast';
+                document.body.appendChild(toast);
+            }
+            toast.textContent = message;
+            toast.classList.add('visible');
+            setTimeout(() => {
+                toast.classList.remove('visible');
+            }, 2000);
+        }
+
+        // ===== DIFF COMPARISON =====
+
+        function toggleDiffSelection(id, checked) {
+            if (checked) {
+                if (selectedForDiff.length < 2) {
+                    selectedForDiff.push(id);
+                } else {
+                    // Already have 2, replace the oldest
+                    selectedForDiff.shift();
+                    selectedForDiff.push(id);
+                    // Update checkboxes in UI
+                    renderRequests();
+                }
+            } else {
+                selectedForDiff = selectedForDiff.filter(x => x !== id);
+            }
+            updateCompareBar();
+        }
+
+        function updateCompareBar() {
+            const bar = document.getElementById('compare-bar');
+            const countEl = document.getElementById('compare-count');
+            const btnCompare = document.getElementById('btn-compare');
+
+            countEl.textContent = selectedForDiff.length;
+
+            if (selectedForDiff.length > 0) {
+                bar.classList.add('visible');
+            } else {
+                bar.classList.remove('visible');
+            }
+
+            btnCompare.disabled = selectedForDiff.length !== 2;
+            btnCompare.style.opacity = selectedForDiff.length === 2 ? '1' : '0.5';
+        }
+
+        function clearDiffSelection() {
+            selectedForDiff = [];
+            updateCompareBar();
+            renderRequests();
+        }
+
+        function showDiffModal() {
+            if (selectedForDiff.length !== 2) return;
+
+            const modal = document.getElementById('diff-modal');
+            modal.classList.add('visible');
+            currentDiffTab = 'url';
+            updateDiffTabs();
+            renderDiffContent();
+        }
+
+        function closeDiffModal(event) {
+            if (event && event.target !== event.currentTarget) return;
+            document.getElementById('diff-modal').classList.remove('visible');
+        }
+
+        function switchDiffTab(tab) {
+            currentDiffTab = tab;
+            updateDiffTabs();
+            renderDiffContent();
+        }
+
+        function updateDiffTabs() {
+            document.querySelectorAll('.diff-tab').forEach(el => {
+                el.classList.toggle('active', el.dataset.diffTab === currentDiffTab);
+            });
+        }
+
+        function renderDiffContent() {
+            const req1 = requestsMap[selectedForDiff[0]];
+            const req2 = requestsMap[selectedForDiff[1]];
+
+            if (!req1 || !req2) return;
+
+            const leftHeader = document.getElementById('diff-left-header');
+            const rightHeader = document.getElementById('diff-right-header');
+            const leftContent = document.getElementById('diff-left-content');
+            const rightContent = document.getElementById('diff-right-content');
+
+            leftHeader.textContent = req1.method + ' ' + req1.path + ' (' + new Date(req1.timestamp).toLocaleTimeString() + ')';
+            rightHeader.textContent = req2.method + ' ' + req2.path + ' (' + new Date(req2.timestamp).toLocaleTimeString() + ')';
+
+            let left = '', right = '';
+
+            switch (currentDiffTab) {
+                case 'url':
+                    left = formatForDiff('Method: ' + req1.method + '\nURL: ' + req1.url + '\nPath: ' + req1.path + '\nStatus: ' + req1.status + '\nDuration: ' + req1.duration);
+                    right = formatForDiff('Method: ' + req2.method + '\nURL: ' + req2.url + '\nPath: ' + req2.path + '\nStatus: ' + req2.status + '\nDuration: ' + req2.duration);
+                    break;
+                case 'headers':
+                    left = formatForDiff(formatHeaders(req1.req_header || {}));
+                    right = formatForDiff(formatHeaders(req2.req_header || {}));
+                    break;
+                case 'body':
+                    left = formatForDiff(formatBody(req1.req_body));
+                    right = formatForDiff(formatBody(req2.req_body));
+                    break;
+            }
+
+            const { leftHtml, rightHtml } = computeDiff(left, right);
+            leftContent.innerHTML = leftHtml;
+            rightContent.innerHTML = rightHtml;
+        }
+
+        function formatHeaders(headers) {
+            if (!headers || Object.keys(headers).length === 0) return '(no headers)';
+            return Object.entries(headers)
+                .map(([k, v]) => k + ': ' + (Array.isArray(v) ? v.join(', ') : v))
+                .sort()
+                .join('\n');
+        }
+
+        function formatBody(body) {
+            if (!body) return '(no body)';
+            try {
+                return JSON.stringify(JSON.parse(body), null, 2);
+            } catch {
+                return body;
+            }
+        }
+
+        function formatForDiff(text) {
+            return text.split('\n');
+        }
+
+        function computeDiff(leftLines, rightLines) {
+            const maxLen = Math.max(leftLines.length, rightLines.length);
+            let leftHtml = '';
+            let rightHtml = '';
+
+            for (let i = 0; i < maxLen; i++) {
+                const l = leftLines[i] || '';
+                const r = rightLines[i] || '';
+
+                if (l === r) {
+                    leftHtml += '<div class="diff-line unchanged">' + escapeHtml(l) + '</div>';
+                    rightHtml += '<div class="diff-line unchanged">' + escapeHtml(r) + '</div>';
+                } else if (!l && r) {
+                    leftHtml += '<div class="diff-line removed">&nbsp;</div>';
+                    rightHtml += '<div class="diff-line added">' + escapeHtml(r) + '</div>';
+                } else if (l && !r) {
+                    leftHtml += '<div class="diff-line removed">' + escapeHtml(l) + '</div>';
+                    rightHtml += '<div class="diff-line added">&nbsp;</div>';
+                } else {
+                    leftHtml += '<div class="diff-line removed">' + escapeHtml(l) + '</div>';
+                    rightHtml += '<div class="diff-line added">' + escapeHtml(r) + '</div>';
+                }
+            }
+
+            return { leftHtml, rightHtml };
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         // ===== TUNNEL MANAGEMENT =====
@@ -2854,7 +3442,21 @@ const dashboardHTML = `
 
             const item = document.createElement('div');
             item.className = 'req-item' + (r.id === selectedId ? ' active' : '');
-            item.onclick = () => selectRequest(r.id);
+            item.onclick = (e) => {
+                if (e.target.type !== 'checkbox') {
+                    selectRequest(r.id);
+                }
+            };
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'diff-checkbox';
+            checkbox.checked = selectedForDiff.includes(r.id);
+            checkbox.onclick = (e) => {
+                e.stopPropagation();
+                toggleDiffSelection(r.id, e.target.checked);
+            };
+            item.appendChild(checkbox);
 
             const dot = document.createElement('div');
             dot.className = 'req-status-dot ' + statusClass;
