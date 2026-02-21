@@ -52,7 +52,7 @@ detect_platform() {
 # Build from source using Go
 build_from_source() {
     log "Building from source with Go..."
-    GOBIN="${INSTALL_DIR}" go install -v "github.com/${REPO}/cmd/tunnel@latest" 2>/dev/null
+    GOPROXY=direct GOBIN="${INSTALL_DIR}" go install -v "github.com/${REPO}/cmd/tunnel@latest"
 }
 
 # Download pre-built binary
