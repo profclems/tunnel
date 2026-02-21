@@ -489,7 +489,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	msg, err := protocol.ReadMessage(ctlStream)
+	msg, ctlReader, err := protocol.ReadMessageBuffered(ctlStream)
 	if err != nil {
 		s.logger.Error("handshake read failed", "error", err)
 		session.Close()
@@ -626,7 +626,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	s.mu.Unlock()
 
 	// Start control message handler for dynamic tunnel management
-	go s.handleControlMessages(ctlStream, agent)
+	go s.handleControlMessages(ctlStream, ctlReader, agent)
 
 	go func() {
 		<-session.CloseChan()
@@ -635,11 +635,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 }
 
 // handleControlMessages handles dynamic tunnel add/remove requests from connected agents
-func (s *Server) handleControlMessages(ctlStream net.Conn, agent *AgentSession) {
-	// Use ReadMessageBuffered once to get the buffered reader, then reuse it
-	// This prevents data loss from creating new bufio.Readers on each iteration
-	var reader io.Reader = ctlStream
-
+func (s *Server) handleControlMessages(ctlStream net.Conn, reader io.Reader, agent *AgentSession) {
 	for {
 		msg, nextReader, err := protocol.ReadMessageBuffered(reader)
 		if err != nil {
