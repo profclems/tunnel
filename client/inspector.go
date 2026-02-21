@@ -1360,17 +1360,43 @@ const dashboardHTML = `
             color: var(--text-secondary);
         }
 
+        .metrics-charts {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .metrics-chart-container {
+            flex: 1;
+        }
+
+        .metrics-chart-label {
+            font-size: 9px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
         .metrics-chart {
-            height: 50px;
+            height: 40px;
             background: var(--bg-tertiary);
             border-radius: 4px;
-            margin-bottom: 8px;
             overflow: hidden;
         }
 
         .metrics-chart svg {
             width: 100%;
             height: 100%;
+        }
+
+        .rate-bar {
+            fill: var(--primary);
+            opacity: 0.7;
+        }
+
+        .rate-bar:last-child {
+            opacity: 1;
         }
 
         .metrics-stats {
@@ -2325,8 +2351,19 @@ const dashboardHTML = `
                 <span class="chevron" id="metrics-chevron">▼</span>
             </div>
             <div class="metrics-panel-body" id="metrics-body">
-                <div class="metrics-chart" id="latency-chart">
-                    <svg id="latency-svg"></svg>
+                <div class="metrics-charts">
+                    <div class="metrics-chart-container">
+                        <div class="metrics-chart-label">Latency (ms)</div>
+                        <div class="metrics-chart" id="latency-chart">
+                            <svg id="latency-svg"></svg>
+                        </div>
+                    </div>
+                    <div class="metrics-chart-container">
+                        <div class="metrics-chart-label">Rate (req/s)</div>
+                        <div class="metrics-chart rate-chart" id="rate-chart">
+                            <svg id="rate-svg"></svg>
+                        </div>
+                    </div>
                 </div>
                 <div class="metrics-stats">
                     <span class="metrics-stat"><span class="down">↓</span> <span id="bytes-in">0 B</span></span>
@@ -2541,6 +2578,9 @@ const dashboardHTML = `
         let metricsData = null;
         let selectedForDiff = [];
         let currentDiffTab = 'url';
+        let reconnectCount = 0;
+        let lastHeartbeat = null;
+        let connectionStartTime = null;
 
         // ===== METRICS =====
 
@@ -2563,6 +2603,37 @@ const dashboardHTML = `
             document.getElementById('error-count').textContent = metricsData.error_count;
 
             renderLatencyChart(metricsData.latency_history || []);
+            renderRateChart(metricsData.rate_history || []);
+        }
+
+        function renderRateChart(rates) {
+            const svg = document.getElementById('rate-svg');
+            if (!svg) return;
+
+            const w = svg.clientWidth || 180;
+            const h = svg.clientHeight || 40;
+            const padding = 2;
+
+            // Use last 30 seconds for the bar chart
+            const data = rates.slice(-30);
+            if (data.length === 0 || data.every(r => r === 0)) {
+                svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#6e7681" font-size="9">No traffic</text>';
+                return;
+            }
+
+            const maxRate = Math.max(...data, 1);
+            const barWidth = (w - padding * 2) / data.length - 1;
+
+            let bars = '';
+            data.forEach((rate, i) => {
+                const x = padding + i * (barWidth + 1);
+                const barHeight = (rate / maxRate) * (h - padding * 2);
+                const y = h - padding - barHeight;
+                bars += '<rect class="rate-bar" x="' + x + '" y="' + y + '" width="' + barWidth + '" height="' + barHeight + '" rx="1"/>';
+            });
+
+            const currentRate = data[data.length - 1] || 0;
+            svg.innerHTML = bars + '<text x="' + (w - padding) + '" y="10" text-anchor="end" fill="var(--text-muted)" font-size="9">' + currentRate + '/s</text>';
         }
 
         function renderLatencyChart(points) {
@@ -3405,20 +3476,52 @@ const dashboardHTML = `
             const statusText = document.getElementById('tunnel-status-text');
 
             if (connected) {
+                if (!connectionStartTime) {
+                    connectionStartTime = new Date();
+                }
+                lastHeartbeat = new Date();
+
                 badge.classList.remove('reconnecting');
                 badge.querySelector('span').textContent = 'Live';
                 dot.classList.remove('disconnected');
-                dot.title = 'Connected';
+                dot.title = getConnectionTooltip();
                 statusText.textContent = '● Connected';
                 statusText.style.color = 'var(--success)';
             } else {
+                reconnectCount++;
+                connectionStartTime = null;
+
                 badge.classList.add('reconnecting');
                 badge.querySelector('span').textContent = 'Reconnecting...';
                 dot.classList.add('disconnected');
-                dot.title = 'Disconnected';
+                dot.title = 'Disconnected - Reconnect #' + reconnectCount;
                 statusText.textContent = '○ Reconnecting...';
                 statusText.style.color = 'var(--warning)';
             }
+        }
+
+        function getConnectionTooltip() {
+            let tooltip = 'Connected';
+            if (lastHeartbeat) {
+                const ago = Math.round((new Date() - lastHeartbeat) / 1000);
+                tooltip += ' • Last heartbeat: ' + (ago < 2 ? 'just now' : ago + 's ago');
+            }
+            if (connectionStartTime) {
+                const uptime = Math.round((new Date() - connectionStartTime) / 1000);
+                tooltip += ' • Uptime: ' + formatUptime(uptime);
+            }
+            if (reconnectCount > 0) {
+                tooltip += ' • Reconnects: ' + reconnectCount;
+            }
+            return tooltip;
+        }
+
+        function formatUptime(seconds) {
+            if (seconds < 60) return seconds + 's';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            return h + 'h ' + m + 'm';
         }
 
         function addRequest(r) {
@@ -3656,6 +3759,14 @@ const dashboardHTML = `
         loadInitial();
         initSSE();
         fetchMetrics();
+
+        // Update connection tooltip every 5 seconds
+        setInterval(function() {
+            if (sseConnected) {
+                const dot = document.getElementById('connection-status');
+                if (dot) dot.title = getConnectionTooltip();
+            }
+        }, 5000);
     </script>
 </body>
 </html>
