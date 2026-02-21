@@ -811,6 +811,95 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// Webhook tester endpoint - send a custom request to a tunnel
+	mux.HandleFunc("/api/webhook-test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		var req struct {
+			URL     string            `json:"url"`
+			Method  string            `json:"method"`
+			Headers map[string]string `json:"headers"`
+			Body    string            `json:"body"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+			return
+		}
+
+		if req.URL == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "URL is required"})
+			return
+		}
+
+		if req.Method == "" {
+			req.Method = "GET"
+		}
+
+		// Create the HTTP request
+		var bodyReader io.Reader
+		if req.Body != "" {
+			bodyReader = strings.NewReader(req.Body)
+		}
+
+		httpReq, err := http.NewRequest(req.Method, req.URL, bodyReader)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Set headers
+		for k, v := range req.Headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		// Send request
+		client := &http.Client{Timeout: 30 * time.Second}
+		start := time.Now()
+		resp, err := client.Do(httpReq)
+		duration := time.Since(start)
+
+		if err != nil {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":       err.Error(),
+				"duration_ms": duration.Milliseconds(),
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		// Read response body
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // Limit to 1MB
+
+		// Return result
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       resp.StatusCode,
+			"status_text":  resp.Status,
+			"headers":      resp.Header,
+			"body":         string(respBody),
+			"duration_ms":  duration.Milliseconds(),
+			"content_type": resp.Header.Get("Content-Type"),
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(dashboardHTML))
 	})
@@ -1214,6 +1303,262 @@ const dashboardHTML = `
 
         .tunnel-action-btn.remove:hover {
             color: var(--error);
+        }
+
+        /* ===== QR CODE MODAL ===== */
+        .qr-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .qr-modal.visible {
+            display: flex;
+        }
+
+        .qr-modal-content {
+            background: var(--bg-main);
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            border: 1px solid var(--border);
+            min-width: 280px;
+        }
+
+        .qr-modal-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+
+        .qr-container {
+            background: white;
+            padding: 16px;
+            border-radius: 8px;
+            display: inline-block;
+            margin-bottom: 16px;
+        }
+
+        .qr-container canvas {
+            display: block;
+        }
+
+        .qr-url {
+            font-size: 12px;
+            color: var(--text-secondary);
+            word-break: break-all;
+            max-width: 250px;
+            margin: 0 auto 16px;
+        }
+
+        .qr-modal-close {
+            padding: 8px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .qr-modal-close:hover {
+            background: var(--border);
+        }
+
+        /* ===== WEBHOOK TESTER ===== */
+        .webhook-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .webhook-modal.visible {
+            display: flex;
+        }
+
+        .webhook-modal-content {
+            background: var(--bg-main);
+            border-radius: 8px;
+            width: 600px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid var(--border);
+        }
+
+        .webhook-modal-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .webhook-modal-title {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .webhook-modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 20px;
+        }
+
+        .webhook-form {
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .webhook-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .webhook-method {
+            width: 100px;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            font-size: 12px;
+        }
+
+        .webhook-url {
+            flex: 1;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            font-size: 12px;
+        }
+
+        .webhook-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            text-transform: uppercase;
+        }
+
+        .webhook-headers {
+            width: 100%;
+            height: 80px;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            font-family: monospace;
+            font-size: 12px;
+            resize: vertical;
+            margin-bottom: 12px;
+        }
+
+        .webhook-body {
+            width: 100%;
+            height: 120px;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            font-family: monospace;
+            font-size: 12px;
+            resize: vertical;
+            margin-bottom: 16px;
+        }
+
+        .webhook-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .btn-webhook-send {
+            padding: 8px 16px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .btn-webhook-send:hover {
+            background: #4a9eff;
+        }
+
+        .btn-webhook-send:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .webhook-response {
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+            display: none;
+        }
+
+        .webhook-response.visible {
+            display: block;
+        }
+
+        .webhook-response-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+
+        .webhook-response-status {
+            font-weight: 600;
+            font-size: 13px;
+        }
+
+        .webhook-response-status.success {
+            color: var(--success);
+        }
+
+        .webhook-response-status.error {
+            color: var(--error);
+        }
+
+        .webhook-response-time {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .webhook-response-body {
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 11px;
+            max-height: 200px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
         }
 
         .tunnel-local-row {
@@ -2563,6 +2908,54 @@ const dashboardHTML = `
         </div>
     </div>
 
+    <!-- QR Code Modal -->
+    <div id="qr-modal" class="qr-modal" onclick="closeQRModal(event)">
+        <div class="qr-modal-content" onclick="event.stopPropagation()">
+            <div class="qr-modal-title">Scan to Open</div>
+            <div class="qr-container">
+                <canvas id="qr-canvas" width="200" height="200"></canvas>
+            </div>
+            <div class="qr-url" id="qr-url"></div>
+            <button class="qr-modal-close" onclick="closeQRModal()">Close</button>
+        </div>
+    </div>
+
+    <!-- Webhook Tester Modal -->
+    <div id="webhook-modal" class="webhook-modal" onclick="closeWebhookModal(event)">
+        <div class="webhook-modal-content" onclick="event.stopPropagation()">
+            <div class="webhook-modal-header">
+                <span class="webhook-modal-title">Webhook Tester</span>
+                <button class="webhook-modal-close" onclick="closeWebhookModal()">&times;</button>
+            </div>
+            <div class="webhook-form">
+                <div class="webhook-row">
+                    <select id="webhook-method" class="webhook-method">
+                        <option value="GET">GET</option>
+                        <option value="POST" selected>POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="PATCH">PATCH</option>
+                        <option value="DELETE">DELETE</option>
+                    </select>
+                    <input type="text" id="webhook-url" class="webhook-url" placeholder="https://your-tunnel.example.com/webhook">
+                </div>
+                <div class="webhook-label">Headers (JSON)</div>
+                <textarea id="webhook-headers" class="webhook-headers" placeholder='{"Content-Type": "application/json"}'></textarea>
+                <div class="webhook-label">Body</div>
+                <textarea id="webhook-body" class="webhook-body" placeholder='{"event": "test", "data": {}}'></textarea>
+                <div class="webhook-actions">
+                    <button id="btn-webhook-send" class="btn-webhook-send" onclick="sendWebhookTest()">Send Request</button>
+                </div>
+                <div id="webhook-response" class="webhook-response">
+                    <div class="webhook-response-header">
+                        <span id="webhook-response-status" class="webhook-response-status"></span>
+                        <span id="webhook-response-time" class="webhook-response-time"></span>
+                    </div>
+                    <pre id="webhook-response-body" class="webhook-response-body"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let tunnelsList = [];
@@ -3035,6 +3428,132 @@ const dashboardHTML = `
             return div.innerHTML;
         }
 
+        // ===== QR CODE =====
+
+        function showQRCode(url) {
+            document.getElementById('qr-url').textContent = url;
+            document.getElementById('qr-modal').classList.add('visible');
+            generateQRCode(url);
+        }
+
+        function closeQRModal(event) {
+            if (event && event.target !== event.currentTarget) return;
+            document.getElementById('qr-modal').classList.remove('visible');
+        }
+
+        // Render QR code using Google Charts API (simple fallback)
+        function generateQRCode(text) {
+            const canvas = document.getElementById('qr-canvas');
+            const ctx = canvas.getContext('2d');
+            const size = 200;
+
+            // Use an image from Google Charts QR API
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function() {
+                ctx.fillStyle = 'white';
+                ctx.fillRect(0, 0, size, size);
+                ctx.drawImage(img, 0, 0, size, size);
+            };
+            img.onerror = function() {
+                // Fallback: draw placeholder with URL text
+                ctx.fillStyle = 'white';
+                ctx.fillRect(0, 0, size, size);
+                ctx.fillStyle = '#333';
+                ctx.font = '12px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('QR Code', size/2, size/2 - 10);
+                ctx.fillText('(scan URL below)', size/2, size/2 + 10);
+            };
+            img.src = 'https://chart.googleapis.com/chart?cht=qr&chs=' + size + 'x' + size + '&chl=' + encodeURIComponent(text) + '&choe=UTF-8';
+        }
+
+        // ===== WEBHOOK TESTER =====
+
+        function showWebhookTester(url) {
+            document.getElementById('webhook-url').value = url || '';
+            document.getElementById('webhook-headers').value = '{"Content-Type": "application/json"}';
+            document.getElementById('webhook-body').value = '';
+            document.getElementById('webhook-response').classList.remove('visible');
+            document.getElementById('webhook-modal').classList.add('visible');
+        }
+
+        function closeWebhookModal(event) {
+            if (event && event.target !== event.currentTarget) return;
+            document.getElementById('webhook-modal').classList.remove('visible');
+        }
+
+        function sendWebhookTest() {
+            const method = document.getElementById('webhook-method').value;
+            const url = document.getElementById('webhook-url').value;
+            const headersStr = document.getElementById('webhook-headers').value;
+            const body = document.getElementById('webhook-body').value;
+            const btn = document.getElementById('btn-webhook-send');
+            const responseDiv = document.getElementById('webhook-response');
+
+            if (!url) {
+                alert('URL is required');
+                return;
+            }
+
+            let headers = {};
+            if (headersStr.trim()) {
+                try {
+                    headers = JSON.parse(headersStr);
+                } catch (e) {
+                    alert('Invalid JSON in headers');
+                    return;
+                }
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+
+            fetch('/api/webhook-test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ url, method, headers, body })
+            })
+            .then(r => r.json())
+            .then(data => {
+                btn.disabled = false;
+                btn.textContent = 'Send Request';
+                responseDiv.classList.add('visible');
+
+                const statusEl = document.getElementById('webhook-response-status');
+                const timeEl = document.getElementById('webhook-response-time');
+                const bodyEl = document.getElementById('webhook-response-body');
+
+                if (data.error) {
+                    statusEl.textContent = 'Error: ' + data.error;
+                    statusEl.className = 'webhook-response-status error';
+                    bodyEl.textContent = '';
+                } else {
+                    statusEl.textContent = data.status_text;
+                    statusEl.className = 'webhook-response-status ' + (data.status < 400 ? 'success' : 'error');
+                    bodyEl.textContent = formatResponseBody(data.body, data.content_type);
+                }
+                timeEl.textContent = data.duration_ms + 'ms';
+            })
+            .catch(err => {
+                btn.disabled = false;
+                btn.textContent = 'Send Request';
+                alert('Error: ' + err.message);
+            });
+        }
+
+        function formatResponseBody(body, contentType) {
+            if (!body) return '(empty response)';
+            if (contentType && contentType.includes('application/json')) {
+                try {
+                    return JSON.stringify(JSON.parse(body), null, 2);
+                } catch {
+                    return body;
+                }
+            }
+            return body;
+        }
+
         // ===== TUNNEL MANAGEMENT =====
 
         function loadTunnels() {
@@ -3203,6 +3722,22 @@ const dashboardHTML = `
             cmdBtn.title = type === 'http' ? 'Copy curl command' : 'Copy SSH command';
             cmdBtn.onclick = (e) => { e.stopPropagation(); copyTunnelCommand(tunnel, cmdBtn); };
             actions.appendChild(cmdBtn);
+
+            const qrBtn = document.createElement('button');
+            qrBtn.className = 'tunnel-action-btn';
+            qrBtn.textContent = '⊞';
+            qrBtn.title = 'Show QR code';
+            qrBtn.onclick = (e) => { e.stopPropagation(); showQRCode(tunnel.public_url); };
+            actions.appendChild(qrBtn);
+
+            if (type === 'http') {
+                const testBtn = document.createElement('button');
+                testBtn.className = 'tunnel-action-btn';
+                testBtn.textContent = '⚡';
+                testBtn.title = 'Test webhook';
+                testBtn.onclick = (e) => { e.stopPropagation(); showWebhookTester(tunnel.public_url); };
+                actions.appendChild(testBtn);
+            }
 
             const removeBtn = document.createElement('button');
             removeBtn.className = 'tunnel-action-btn remove';
