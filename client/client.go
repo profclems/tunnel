@@ -504,6 +504,8 @@ func extractSubdomainFromURL(rawURL string) string {
 
 // handleControlResponses handles async responses from the server for dynamic tunnel operations
 func (c *Client) handleControlResponses(ctlStream net.Conn) {
+	c.logger.Info("control response handler started")
+
 	// Use ReadMessageBuffered once to get the buffered reader, then reuse it
 	// This prevents data loss from creating new bufio.Readers on each iteration
 	var reader io.Reader = ctlStream
@@ -511,20 +513,25 @@ func (c *Client) handleControlResponses(ctlStream net.Conn) {
 	for {
 		msg, nextReader, err := protocol.ReadMessageBuffered(reader)
 		if err != nil {
+			c.logger.Info("control response handler exiting", "error", err)
 			return // Stream closed
 		}
 		reader = nextReader // Reuse the buffered reader
+
+		c.logger.Info("received control response", "type", msg.Type)
 
 		switch msg.Type {
 		case protocol.MsgTunnelAddResponse:
 			var resp protocol.TunnelAddResponse
 			if err := json.Unmarshal(msg.Payload, &resp); err == nil {
+				c.logger.Info("dispatching tunnel add response", "requestID", resp.RequestID, "success", resp.Success)
 				c.handlePendingResponse(resp.RequestID, resp)
 			}
 
 		case protocol.MsgTunnelRemoveResponse:
 			var resp protocol.TunnelRemoveResponse
 			if err := json.Unmarshal(msg.Payload, &resp); err == nil {
+				c.logger.Info("dispatching tunnel remove response", "requestID", resp.RequestID, "success", resp.Success)
 				c.handlePendingResponse(resp.RequestID, resp)
 			}
 		}
@@ -548,6 +555,7 @@ func (c *Client) handlePendingResponse(requestID string, resp interface{}) {
 // AddTunnel dynamically adds a new tunnel
 func (c *Client) AddTunnel(t TunnelConfig) (*protocol.TunnelAddResponse, error) {
 	requestID := uuid.NewString()
+	c.logger.Info("adding tunnel", "requestID", requestID, "type", t.Type, "subdomain", t.Subdomain, "localAddr", t.LocalAddr)
 
 	req := protocol.TunnelAddRequest{
 		RequestID: requestID,
@@ -572,8 +580,10 @@ func (c *Client) AddTunnel(t TunnelConfig) (*protocol.TunnelAddResponse, error) 
 		c.pendingMu.Lock()
 		delete(c.pending, requestID)
 		c.pendingMu.Unlock()
+		c.logger.Error("not connected to server")
 		return nil, fmt.Errorf("not connected to server")
 	}
+	c.logger.Info("sending tunnel add request to server", "requestID", requestID)
 	err := protocol.WriteMessage(c.ctlStream, protocol.MsgTunnelAdd, req)
 	c.ctlStreamMu.Unlock()
 
@@ -581,8 +591,11 @@ func (c *Client) AddTunnel(t TunnelConfig) (*protocol.TunnelAddResponse, error) 
 		c.pendingMu.Lock()
 		delete(c.pending, requestID)
 		c.pendingMu.Unlock()
+		c.logger.Error("failed to send tunnel add request", "error", err)
 		return nil, fmt.Errorf("failed to send tunnel add request: %w", err)
 	}
+
+	c.logger.Info("tunnel add request sent, waiting for response", "requestID", requestID)
 
 	// Wait for response with timeout
 	select {

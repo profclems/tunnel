@@ -636,13 +636,17 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 
 // handleControlMessages handles dynamic tunnel add/remove requests from connected agents
 func (s *Server) handleControlMessages(ctlStream net.Conn, reader io.Reader, agent *AgentSession) {
+	s.logger.Info("control message handler started", "agent", agent.ID)
 	for {
 		msg, nextReader, err := protocol.ReadMessageBuffered(reader)
 		if err != nil {
 			// Stream closed or error - agent disconnected
+			s.logger.Info("control message handler exiting", "agent", agent.ID, "error", err)
 			return
 		}
 		reader = nextReader // Reuse the buffered reader
+
+		s.logger.Info("received control message", "type", msg.Type, "agent", agent.ID)
 
 		switch msg.Type {
 		case protocol.MsgTunnelAdd:
@@ -657,8 +661,11 @@ func (s *Server) handleControlMessages(ctlStream net.Conn, reader io.Reader, age
 
 // handleTunnelAdd processes a dynamic tunnel add request
 func (s *Server) handleTunnelAdd(ctlStream net.Conn, agent *AgentSession, payload json.RawMessage) {
+	s.logger.Info("processing tunnel add request", "agent", agent.ID)
+
 	var req protocol.TunnelAddRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
+		s.logger.Error("failed to unmarshal tunnel add request", "error", err)
 		protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
 			RequestID: "",
 			Success:   false,
@@ -666,6 +673,8 @@ func (s *Server) handleTunnelAdd(ctlStream net.Conn, agent *AgentSession, payloa
 		})
 		return
 	}
+
+	s.logger.Info("tunnel add request details", "requestID", req.RequestID, "type", req.Tunnel.Type, "subdomain", req.Tunnel.Subdomain)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
