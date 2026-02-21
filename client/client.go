@@ -18,16 +18,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/yamux"
 	"github.com/profclems/tunnel/protocol"
 )
 
 // TunnelConfig defines a single tunnel
 type TunnelConfig struct {
-	Type       string // "http" or "tcp"
-	Subdomain  string // for http
-	RemotePort int    // for tcp
-	LocalAddr  string
+	Type       string `json:"type"`                  // "http" or "tcp"
+	Subdomain  string `json:"subdomain,omitempty"`   // for http
+	RemotePort int    `json:"remote_port,omitempty"` // for tcp
+	LocalAddr  string `json:"local_addr"`
+	PublicURL  string `json:"public_url,omitempty"` // assigned by server
 }
 
 // Config holds client configuration
@@ -51,18 +53,54 @@ type Client struct {
 	config    Config
 	logger    *slog.Logger
 	inspector *Inspector
+
+	// Thread-safe tunnel state
+	tunnelsMu sync.RWMutex
+	tunnels   []TunnelConfig
+
+	// Control stream for dynamic tunnel operations
+	ctlStreamMu sync.Mutex
+	ctlStream   net.Conn
+
+	// Pending requests for async responses
+	pendingMu sync.Mutex
+	pending   map[string]chan interface{}
+
+	// Config manager for persistence
+	configMgr *ConfigManager
 }
 
 // NewClient creates a new tunnel client
 func NewClient(cfg Config, logger *slog.Logger) *Client {
 	c := &Client{
-		config: cfg,
-		logger: logger,
+		config:  cfg,
+		logger:  logger,
+		pending: make(map[string]chan interface{}),
 	}
 	if cfg.Inspect {
 		c.inspector = NewInspector()
 	}
 	return c
+}
+
+// SetConfigManager sets the config manager for persistence
+func (c *Client) SetConfigManager(cm *ConfigManager) {
+	c.configMgr = cm
+}
+
+// GetInspector returns the inspector instance
+func (c *Client) GetInspector() *Inspector {
+	return c.inspector
+}
+
+// GetTunnels returns the current list of tunnels (thread-safe)
+func (c *Client) GetTunnels() []TunnelConfig {
+	c.tunnelsMu.RLock()
+	defer c.tunnelsMu.RUnlock()
+
+	tunnels := make([]TunnelConfig, len(c.tunnels))
+	copy(tunnels, c.tunnels)
+	return tunnels
 }
 
 // createTLSConfig creates a TLS configuration for connecting to the server
@@ -101,6 +139,11 @@ func (c *Client) createTLSConfig() (*tls.Config, error) {
 // Start runs the client
 func (c *Client) Start(ctx context.Context) error {
 	if c.config.Inspect {
+		// Wire up inspector with client and config manager for tunnel management
+		c.inspector.SetClient(c)
+		if c.configMgr != nil {
+			c.inspector.SetConfigManager(c.configMgr)
+		}
 		go c.inspector.ServeDashboard(ctx, c.config.InspectPort)
 	}
 
@@ -206,16 +249,35 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	// Update tunnel configs with assigned subdomains from server
 	// Server returns URLs in the same order as tunnel requests
-	for i, url := range resp.URLs {
-		c.logger.Info("tunnel established", "url", url)
+	c.tunnelsMu.Lock()
+	c.tunnels = make([]TunnelConfig, len(c.config.Tunnels))
+	copy(c.tunnels, c.config.Tunnels)
 
-		// For HTTP tunnels without explicit subdomain, extract the assigned one
-		if i < len(c.config.Tunnels) && c.config.Tunnels[i].Type == "http" && c.config.Tunnels[i].Subdomain == "" {
-			if subdomain := extractSubdomainFromURL(url); subdomain != "" {
-				c.config.Tunnels[i].Subdomain = subdomain
+	for i, tunnelURL := range resp.URLs {
+		c.logger.Info("tunnel established", "url", tunnelURL)
+
+		if i < len(c.tunnels) {
+			// Set the public URL
+			c.tunnels[i].PublicURL = tunnelURL
+
+			// For HTTP tunnels without explicit subdomain, extract the assigned one
+			if c.tunnels[i].Type == "http" && c.tunnels[i].Subdomain == "" {
+				if subdomain := extractSubdomainFromURL(tunnelURL); subdomain != "" {
+					c.tunnels[i].Subdomain = subdomain
+					c.config.Tunnels[i].Subdomain = subdomain
+				}
 			}
 		}
 	}
+	c.tunnelsMu.Unlock()
+
+	// Store control stream for dynamic tunnel operations
+	c.ctlStreamMu.Lock()
+	c.ctlStream = ctlStream
+	c.ctlStreamMu.Unlock()
+
+	// Start control response handler
+	go c.handleControlResponses(ctlStream)
 
 	go func() {
 		select {
@@ -266,9 +328,11 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 		return
 	}
 
+	// Thread-safe tunnel lookup
+	c.tunnelsMu.RLock()
 	var target TunnelConfig
 	found := false
-	for _, t := range c.config.Tunnels {
+	for _, t := range c.tunnels {
 		if t.Type == "http" && t.Subdomain == init.Subdomain {
 			target = t
 			found = true
@@ -280,6 +344,7 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 			break
 		}
 	}
+	c.tunnelsMu.RUnlock()
 
 	if !found {
 		c.logger.Error("unknown subdomain requested", "subdomain", init.Subdomain)
@@ -435,4 +500,182 @@ func extractSubdomainFromURL(rawURL string) string {
 		return hostname[:idx]
 	}
 	return ""
+}
+
+// handleControlResponses handles async responses from the server for dynamic tunnel operations
+func (c *Client) handleControlResponses(ctlStream net.Conn) {
+	// Use ReadMessageBuffered once to get the buffered reader, then reuse it
+	// This prevents data loss from creating new bufio.Readers on each iteration
+	var reader io.Reader = ctlStream
+
+	for {
+		msg, nextReader, err := protocol.ReadMessageBuffered(reader)
+		if err != nil {
+			return // Stream closed
+		}
+		reader = nextReader // Reuse the buffered reader
+
+		switch msg.Type {
+		case protocol.MsgTunnelAddResponse:
+			var resp protocol.TunnelAddResponse
+			if err := json.Unmarshal(msg.Payload, &resp); err == nil {
+				c.handlePendingResponse(resp.RequestID, resp)
+			}
+
+		case protocol.MsgTunnelRemoveResponse:
+			var resp protocol.TunnelRemoveResponse
+			if err := json.Unmarshal(msg.Payload, &resp); err == nil {
+				c.handlePendingResponse(resp.RequestID, resp)
+			}
+		}
+	}
+}
+
+func (c *Client) handlePendingResponse(requestID string, resp interface{}) {
+	c.pendingMu.Lock()
+	ch, ok := c.pending[requestID]
+	if ok {
+		delete(c.pending, requestID)
+	}
+	c.pendingMu.Unlock()
+
+	if ok {
+		ch <- resp
+		close(ch)
+	}
+}
+
+// AddTunnel dynamically adds a new tunnel
+func (c *Client) AddTunnel(t TunnelConfig) (*protocol.TunnelAddResponse, error) {
+	requestID := uuid.NewString()
+
+	req := protocol.TunnelAddRequest{
+		RequestID: requestID,
+		Tunnel: protocol.TunnelRequest{
+			Type:       t.Type,
+			Subdomain:  t.Subdomain,
+			RemotePort: t.RemotePort,
+		},
+		LocalAddr: t.LocalAddr,
+	}
+
+	// Create response channel
+	respCh := make(chan interface{}, 1)
+	c.pendingMu.Lock()
+	c.pending[requestID] = respCh
+	c.pendingMu.Unlock()
+
+	// Send request
+	c.ctlStreamMu.Lock()
+	if c.ctlStream == nil {
+		c.ctlStreamMu.Unlock()
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	err := protocol.WriteMessage(c.ctlStream, protocol.MsgTunnelAdd, req)
+	c.ctlStreamMu.Unlock()
+
+	if err != nil {
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("failed to send tunnel add request: %w", err)
+	}
+
+	// Wait for response with timeout
+	select {
+	case resp := <-respCh:
+		addResp := resp.(protocol.TunnelAddResponse)
+		if addResp.Success {
+			// Update local tunnel list
+			c.tunnelsMu.Lock()
+			// Update subdomain/port if it was auto-assigned
+			if t.Type == "http" && t.Subdomain == "" && addResp.URL != "" {
+				t.Subdomain = extractSubdomainFromURL(addResp.URL)
+			}
+			if t.Type == "tcp" && addResp.AssignedPort != 0 {
+				t.RemotePort = addResp.AssignedPort
+			}
+			// Set public URL from server response
+			t.PublicURL = addResp.URL
+			c.tunnels = append(c.tunnels, t)
+			c.tunnelsMu.Unlock()
+		}
+		return &addResp, nil
+
+	case <-time.After(30 * time.Second):
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("timeout waiting for tunnel add response")
+	}
+}
+
+// RemoveTunnel dynamically removes a tunnel
+func (c *Client) RemoveTunnel(tunnelType, subdomain string, port int) (*protocol.TunnelRemoveResponse, error) {
+	requestID := uuid.NewString()
+
+	req := protocol.TunnelRemoveRequest{
+		RequestID:  requestID,
+		Type:       tunnelType,
+		Subdomain:  subdomain,
+		RemotePort: port,
+	}
+
+	// Create response channel
+	respCh := make(chan interface{}, 1)
+	c.pendingMu.Lock()
+	c.pending[requestID] = respCh
+	c.pendingMu.Unlock()
+
+	// Send request
+	c.ctlStreamMu.Lock()
+	if c.ctlStream == nil {
+		c.ctlStreamMu.Unlock()
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("not connected to server")
+	}
+	err := protocol.WriteMessage(c.ctlStream, protocol.MsgTunnelRemove, req)
+	c.ctlStreamMu.Unlock()
+
+	if err != nil {
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("failed to send tunnel remove request: %w", err)
+	}
+
+	// Wait for response with timeout
+	select {
+	case resp := <-respCh:
+		removeResp := resp.(protocol.TunnelRemoveResponse)
+		if removeResp.Success {
+			// Update local tunnel list
+			c.tunnelsMu.Lock()
+			for i, t := range c.tunnels {
+				if t.Type == tunnelType {
+					if tunnelType == "http" && t.Subdomain == subdomain {
+						c.tunnels = append(c.tunnels[:i], c.tunnels[i+1:]...)
+						break
+					}
+					if tunnelType == "tcp" && t.RemotePort == port {
+						c.tunnels = append(c.tunnels[:i], c.tunnels[i+1:]...)
+						break
+					}
+				}
+			}
+			c.tunnelsMu.Unlock()
+		}
+		return &removeResp, nil
+
+	case <-time.After(30 * time.Second):
+		c.pendingMu.Lock()
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("timeout waiting for tunnel remove response")
+	}
 }

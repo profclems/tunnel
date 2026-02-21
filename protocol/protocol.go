@@ -14,6 +14,12 @@ const (
 	MsgAuthRequest  MessageType = "AUTH_REQ"
 	MsgAuthResponse MessageType = "AUTH_RES"
 	MsgTunnelInit   MessageType = "TUNNEL_INIT"
+
+	// Dynamic tunnel management
+	MsgTunnelAdd            MessageType = "TUNNEL_ADD"
+	MsgTunnelAddResponse    MessageType = "TUNNEL_ADD_RES"
+	MsgTunnelRemove         MessageType = "TUNNEL_REMOVE"
+	MsgTunnelRemoveResponse MessageType = "TUNNEL_REMOVE_RES"
 )
 
 // ControlMessage is the envelope for control plane communication
@@ -45,6 +51,37 @@ type AuthResponse struct {
 // TunnelInit is sent as the first message on a new data stream
 type TunnelInit struct {
 	Subdomain string `json:"subdomain"`
+}
+
+// TunnelAddRequest is sent by the client to dynamically add a new tunnel
+type TunnelAddRequest struct {
+	RequestID string        `json:"request_id"`
+	Tunnel    TunnelRequest `json:"tunnel"`
+	LocalAddr string        `json:"local_addr"`
+}
+
+// TunnelAddResponse is sent by the server confirming tunnel addition
+type TunnelAddResponse struct {
+	RequestID    string `json:"request_id"`
+	Success      bool   `json:"success"`
+	Error        string `json:"error,omitempty"`
+	URL          string `json:"url,omitempty"`
+	AssignedPort int    `json:"assigned_port,omitempty"`
+}
+
+// TunnelRemoveRequest is sent by the client to remove an existing tunnel
+type TunnelRemoveRequest struct {
+	RequestID  string `json:"request_id"`
+	Type       string `json:"type"`
+	Subdomain  string `json:"subdomain,omitempty"`
+	RemotePort int    `json:"remote_port,omitempty"`
+}
+
+// TunnelRemoveResponse is sent by the server confirming tunnel removal
+type TunnelRemoveResponse struct {
+	RequestID string `json:"request_id"`
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`
 }
 
 // WriteMessage sends a JSON control message

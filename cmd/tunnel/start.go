@@ -155,6 +155,13 @@ Usage:
 
 			c := client.NewClient(clientCfg, logger)
 
+			// Set up config manager for persistence
+			configPath := v.ConfigFileUsed()
+			if configPath != "" {
+				configMgr := client.NewConfigManager(configPath)
+				c.SetConfigManager(configMgr)
+			}
+
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 

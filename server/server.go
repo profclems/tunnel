@@ -625,10 +625,246 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 
 	s.mu.Unlock()
 
+	// Start control message handler for dynamic tunnel management
+	go s.handleControlMessages(ctlStream, agent)
+
 	go func() {
 		<-session.CloseChan()
 		s.cleanupAgent(agent)
 	}()
+}
+
+// handleControlMessages handles dynamic tunnel add/remove requests from connected agents
+func (s *Server) handleControlMessages(ctlStream net.Conn, agent *AgentSession) {
+	// Use ReadMessageBuffered once to get the buffered reader, then reuse it
+	// This prevents data loss from creating new bufio.Readers on each iteration
+	var reader io.Reader = ctlStream
+
+	for {
+		msg, nextReader, err := protocol.ReadMessageBuffered(reader)
+		if err != nil {
+			// Stream closed or error - agent disconnected
+			return
+		}
+		reader = nextReader // Reuse the buffered reader
+
+		switch msg.Type {
+		case protocol.MsgTunnelAdd:
+			s.handleTunnelAdd(ctlStream, agent, msg.Payload)
+		case protocol.MsgTunnelRemove:
+			s.handleTunnelRemove(ctlStream, agent, msg.Payload)
+		default:
+			s.logger.Warn("unknown control message type", "type", msg.Type)
+		}
+	}
+}
+
+// handleTunnelAdd processes a dynamic tunnel add request
+func (s *Server) handleTunnelAdd(ctlStream net.Conn, agent *AgentSession, payload json.RawMessage) {
+	var req protocol.TunnelAddRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+			RequestID: "",
+			Success:   false,
+			Error:     "invalid request payload",
+		})
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.Tunnel.Type == "http" {
+		url, err := s.addHTTPTunnelLocked(agent, req.Tunnel.Subdomain)
+		if err != nil {
+			protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+				RequestID: req.RequestID,
+				Success:   false,
+				Error:     err.Error(),
+			})
+			return
+		}
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+			RequestID: req.RequestID,
+			Success:   true,
+			URL:       url,
+		})
+		s.logger.Info("tunnel added dynamically", "type", "http", "subdomain", req.Tunnel.Subdomain, "agent", agent.ID)
+
+	} else if req.Tunnel.Type == "tcp" {
+		url, port, err := s.addTCPTunnelLocked(agent, req.Tunnel.RemotePort)
+		if err != nil {
+			protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+				RequestID: req.RequestID,
+				Success:   false,
+				Error:     err.Error(),
+			})
+			return
+		}
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+			RequestID:    req.RequestID,
+			Success:      true,
+			URL:          url,
+			AssignedPort: port,
+		})
+		s.logger.Info("tunnel added dynamically", "type", "tcp", "port", port, "agent", agent.ID)
+
+	} else {
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelAddResponse, protocol.TunnelAddResponse{
+			RequestID: req.RequestID,
+			Success:   false,
+			Error:     fmt.Sprintf("unknown tunnel type: %s", req.Tunnel.Type),
+		})
+	}
+}
+
+// addHTTPTunnelLocked adds an HTTP tunnel (must be called with s.mu held)
+func (s *Server) addHTTPTunnelLocked(agent *AgentSession, subdomain string) (string, error) {
+	sub := strings.ToLower(subdomain)
+	if sub == "" {
+		sub = generateSubdomain()
+	} else {
+		if err := validateSubdomain(sub); err != nil {
+			return "", err
+		}
+	}
+
+	if _, exists := s.httpRegistry[sub]; exists {
+		return "", fmt.Errorf("subdomain %s already in use", sub)
+	}
+
+	s.httpRegistry[sub] = agent
+	agent.Subdomains = append(agent.Subdomains, sub)
+
+	// Build URL
+	url := fmt.Sprintf("%s.%s", sub, s.config.Domain)
+	if s.config.TLSEmail != "" {
+		url = "https://" + url
+	} else if s.config.PublicPort != 80 {
+		url = fmt.Sprintf("http://%s:%d", url, s.config.PublicPort)
+	} else {
+		url = "http://" + url
+	}
+
+	return url, nil
+}
+
+// addTCPTunnelLocked adds a TCP tunnel (must be called with s.mu held)
+func (s *Server) addTCPTunnelLocked(agent *AgentSession, requestedPort int) (string, int, error) {
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", requestedPort))
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to bind port %d: %v", requestedPort, err)
+	}
+
+	actualPort := l.Addr().(*net.TCPAddr).Port
+
+	if _, exists := s.tcpRegistry[actualPort]; exists {
+		l.Close()
+		return "", 0, fmt.Errorf("port %d already in use", actualPort)
+	}
+
+	s.tcpListeners[actualPort] = l
+	s.tcpRegistry[actualPort] = agent
+	agent.TCPPorts = append(agent.TCPPorts, actualPort)
+
+	go s.handleTCPListener(l, agent, actualPort)
+
+	url := fmt.Sprintf("tcp://%s:%d", s.config.Domain, actualPort)
+	return url, actualPort, nil
+}
+
+// handleTunnelRemove processes a dynamic tunnel remove request
+func (s *Server) handleTunnelRemove(ctlStream net.Conn, agent *AgentSession, payload json.RawMessage) {
+	var req protocol.TunnelRemoveRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelRemoveResponse, protocol.TunnelRemoveResponse{
+			RequestID: "",
+			Success:   false,
+			Error:     "invalid request payload",
+		})
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var err error
+	if req.Type == "http" {
+		err = s.removeHTTPTunnelLocked(agent, req.Subdomain)
+	} else if req.Type == "tcp" {
+		err = s.removeTCPTunnelLocked(agent, req.RemotePort)
+	} else {
+		err = fmt.Errorf("unknown tunnel type: %s", req.Type)
+	}
+
+	if err != nil {
+		protocol.WriteMessage(ctlStream, protocol.MsgTunnelRemoveResponse, protocol.TunnelRemoveResponse{
+			RequestID: req.RequestID,
+			Success:   false,
+			Error:     err.Error(),
+		})
+		return
+	}
+
+	protocol.WriteMessage(ctlStream, protocol.MsgTunnelRemoveResponse, protocol.TunnelRemoveResponse{
+		RequestID: req.RequestID,
+		Success:   true,
+	})
+	s.logger.Info("tunnel removed dynamically", "type", req.Type, "agent", agent.ID)
+}
+
+// removeHTTPTunnelLocked removes an HTTP tunnel (must be called with s.mu held)
+func (s *Server) removeHTTPTunnelLocked(agent *AgentSession, subdomain string) error {
+	sub := strings.ToLower(subdomain)
+
+	existing, exists := s.httpRegistry[sub]
+	if !exists {
+		return fmt.Errorf("tunnel not found: %s", sub)
+	}
+	if existing.ID != agent.ID {
+		return fmt.Errorf("tunnel does not belong to this agent")
+	}
+
+	delete(s.httpRegistry, sub)
+
+	// Remove from agent's subdomain list
+	for i, sd := range agent.Subdomains {
+		if sd == sub {
+			agent.Subdomains = append(agent.Subdomains[:i], agent.Subdomains[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+// removeTCPTunnelLocked removes a TCP tunnel (must be called with s.mu held)
+func (s *Server) removeTCPTunnelLocked(agent *AgentSession, port int) error {
+	existing, exists := s.tcpRegistry[port]
+	if !exists {
+		return fmt.Errorf("tunnel not found: port %d", port)
+	}
+	if existing.ID != agent.ID {
+		return fmt.Errorf("tunnel does not belong to this agent")
+	}
+
+	// Close the listener
+	if l, ok := s.tcpListeners[port]; ok {
+		l.Close()
+		delete(s.tcpListeners, port)
+	}
+
+	delete(s.tcpRegistry, port)
+
+	// Remove from agent's port list
+	for i, p := range agent.TCPPorts {
+		if p == port {
+			agent.TCPPorts = append(agent.TCPPorts[:i], agent.TCPPorts[i+1:]...)
+			break
+		}
+	}
+
+	return nil
 }
 
 // cleanupAgent removes an agent's tunnels from the registries
