@@ -453,6 +453,20 @@ type ReplayResult struct {
 	ResBody   string      `json:"res_body"`
 }
 
+// headersToHAR converts http.Header to HAR format
+func headersToHAR(h http.Header) []map[string]string {
+	result := make([]map[string]string, 0)
+	for name, values := range h {
+		for _, value := range values {
+			result = append(result, map[string]string{
+				"name":  name,
+				"value": value,
+			})
+		}
+	}
+	return result
+}
+
 // replayRequest replays a captured request to the local service
 func (i *Inspector) replayRequest(rec *RequestRecord) (*ReplayResult, error) {
 	start := time.Now()
@@ -898,6 +912,68 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 			"duration_ms":  duration.Milliseconds(),
 			"content_type": resp.Header.Get("Content-Type"),
 		})
+	})
+
+	// HAR export endpoint
+	mux.HandleFunc("/api/export/har", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", "attachment; filename=tunnel-requests.har")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		i.mu.RLock()
+		requests := make([]*RequestRecord, len(i.requests))
+		copy(requests, i.requests)
+		i.mu.RUnlock()
+
+		// Build HAR format
+		entries := make([]map[string]interface{}, 0, len(requests))
+		for _, req := range requests {
+			entry := map[string]interface{}{
+				"startedDateTime": req.Timestamp.Format(time.RFC3339),
+				"time":            req.DurationMs,
+				"request": map[string]interface{}{
+					"method":      req.Method,
+					"url":         req.URL,
+					"httpVersion": "HTTP/1.1",
+					"headers":     headersToHAR(req.ReqHeader),
+					"queryString": []interface{}{},
+					"bodySize":    req.ReqBodySize,
+					"postData": map[string]interface{}{
+						"mimeType": req.ReqHeader.Get("Content-Type"),
+						"text":     req.ReqBody,
+					},
+				},
+				"response": map[string]interface{}{
+					"status":      req.Status,
+					"statusText":  http.StatusText(req.Status),
+					"httpVersion": "HTTP/1.1",
+					"headers":     headersToHAR(req.ResHeader),
+					"content": map[string]interface{}{
+						"size":     req.ResBodySize,
+						"mimeType": req.ContentType,
+						"text":     req.ResBody,
+					},
+					"bodySize": req.ResBodySize,
+				},
+				"timings": map[string]interface{}{
+					"wait": req.DurationMs,
+				},
+			}
+			entries = append(entries, entry)
+		}
+
+		har := map[string]interface{}{
+			"log": map[string]interface{}{
+				"version": "1.2",
+				"creator": map[string]interface{}{
+					"name":    "Tunnel Inspector",
+					"version": "1.0",
+				},
+				"entries": entries,
+			},
+		}
+
+		json.NewEncoder(w).Encode(har)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1831,6 +1907,54 @@ const dashboardHTML = `
             color: var(--text-secondary);
         }
 
+        .traffic-header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-export-har {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            opacity: 0.5;
+            transition: opacity 0.1s;
+        }
+
+        .btn-export-har:hover {
+            opacity: 0.8;
+        }
+
+        .btn-notify {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            opacity: 0.5;
+            transition: opacity 0.1s;
+        }
+
+        .btn-notify:hover {
+            opacity: 0.8;
+        }
+
+        .btn-notify.active {
+            opacity: 1;
+        }
+
+        .btn-notify.active .notify-icon {
+            animation: bell-ring 0.5s ease;
+        }
+
+        @keyframes bell-ring {
+            0%, 100% { transform: rotate(0); }
+            25% { transform: rotate(15deg); }
+            75% { transform: rotate(-15deg); }
+        }
+
         .traffic-live-badge {
             display: flex;
             align-items: center;
@@ -2722,9 +2846,17 @@ const dashboardHTML = `
         <!-- Traffic Section -->
         <div class="traffic-header">
             <h1>Traffic</h1>
-            <div class="traffic-live-badge" id="traffic-badge">
-                <div class="traffic-live-dot"></div>
-                <span>Live</span>
+            <div class="traffic-header-actions">
+                <button class="btn-export-har" onclick="exportHAR()" title="Export as HAR file">
+                    <span>📥</span>
+                </button>
+                <button class="btn-notify" id="btn-notify" onclick="toggleNotifications()" title="Enable desktop notifications for errors">
+                    <span class="notify-icon">🔔</span>
+                </button>
+                <div class="traffic-live-badge" id="traffic-badge">
+                    <div class="traffic-live-dot"></div>
+                    <span>Live</span>
+                </div>
             </div>
         </div>
 
@@ -2974,6 +3106,7 @@ const dashboardHTML = `
         let reconnectCount = 0;
         let lastHeartbeat = null;
         let connectionStartTime = null;
+        let notificationsEnabled = false;
 
         // ===== METRICS =====
 
@@ -4059,6 +4192,53 @@ const dashboardHTML = `
             return h + 'h ' + m + 'm';
         }
 
+        // ===== NOTIFICATIONS =====
+
+        async function toggleNotifications() {
+            const btn = document.getElementById('btn-notify');
+
+            if (!notificationsEnabled) {
+                if ('Notification' in window) {
+                    const perm = await Notification.requestPermission();
+                    if (perm === 'granted') {
+                        notificationsEnabled = true;
+                        btn.classList.add('active');
+                        btn.title = 'Disable desktop notifications';
+                        showCopyToast('Notifications enabled for errors');
+                    } else {
+                        showCopyToast('Notification permission denied');
+                    }
+                } else {
+                    showCopyToast('Notifications not supported');
+                }
+            } else {
+                notificationsEnabled = false;
+                btn.classList.remove('active');
+                btn.title = 'Enable desktop notifications for errors';
+                showCopyToast('Notifications disabled');
+            }
+        }
+
+        function notifyError(req) {
+            if (notificationsEnabled && req.status >= 500) {
+                new Notification('Request Error', {
+                    body: req.method + ' ' + req.path + ' → ' + req.status,
+                    tag: req.id,
+                    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠️</text></svg>'
+                });
+            }
+        }
+
+        function exportHAR() {
+            const a = document.createElement('a');
+            a.href = '/api/export/har';
+            a.download = 'tunnel-requests.har';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            showCopyToast('HAR file downloaded');
+        }
+
         function addRequest(r) {
             requestsMap[r.id] = r;
             requestsList.unshift(r);
@@ -4068,6 +4248,8 @@ const dashboardHTML = `
             }
             // Re-apply filters
             filterRequests();
+            // Notify on errors
+            notifyError(r);
         }
 
         function renderList() {
