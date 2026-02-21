@@ -1990,7 +1990,7 @@ const dashboardHTML = `
             if (type === 'http') {
                 url.textContent = tunnel.public_url || tunnel.subdomain + '.px.csam.dev';
             } else {
-                url.textContent = 'tcp://' + (tunnel.public_url || 'px.csam.dev:' + tunnel.remote_port);
+                url.textContent = tunnel.public_url || 'tcp://px.csam.dev:' + tunnel.remote_port;
             }
             url.title = url.textContent;
             mainRow.appendChild(url);
