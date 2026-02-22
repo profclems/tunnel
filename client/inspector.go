@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,9 @@ type MetricsSnapshot struct {
 	ErrorCount     int64          `json:"error_count"`
 	AvgLatencyMs   int64          `json:"avg_latency_ms"`
 	RequestsPerMin float64        `json:"requests_per_min"`
+	P50LatencyMs   int64          `json:"p50_latency_ms"`
+	P95LatencyMs   int64          `json:"p95_latency_ms"`
+	P99LatencyMs   int64          `json:"p99_latency_ms"`
 }
 
 // Inspector manages request introspection
@@ -252,14 +256,29 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 		rateHistory[j] = i.metrics.rateBuckets[sec]
 	}
 
-	// Calculate average latency
-	var avgLatency int64
+	// Calculate average latency and percentiles
+	var avgLatency, p50, p95, p99 int64
 	if len(latency) > 0 {
 		var total int64
-		for _, p := range latency {
+		sorted := make([]int64, len(latency))
+		for idx, p := range latency {
 			total += p.LatencyMs
+			sorted[idx] = p.LatencyMs
 		}
 		avgLatency = total / int64(len(latency))
+
+		// Sort for percentile calculation
+		sort.Slice(sorted, func(a, b int) bool { return sorted[a] < sorted[b] })
+
+		// Calculate percentiles
+		n := len(sorted)
+		p50 = sorted[n*50/100]
+		p95 = sorted[n*95/100]
+		if n > 1 {
+			p99 = sorted[n*99/100]
+		} else {
+			p99 = sorted[n-1]
+		}
 	}
 
 	// Calculate requests per minute
@@ -278,6 +297,9 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 		ErrorCount:     i.metrics.ErrorCount,
 		AvgLatencyMs:   avgLatency,
 		RequestsPerMin: reqPerMin,
+		P50LatencyMs:   p50,
+		P95LatencyMs:   p95,
+		P99LatencyMs:   p99,
 	}
 }
 
@@ -1827,6 +1849,27 @@ const dashboardHTML = `
             color: var(--text-secondary);
         }
 
+        .metrics-percentiles {
+            display: flex;
+            justify-content: space-around;
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+        }
+
+        .metrics-percentiles span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .metrics-percentiles b {
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
         .metrics-stat {
             display: flex;
             align-items: center;
@@ -1925,6 +1968,140 @@ const dashboardHTML = `
 
         .btn-export-har:hover {
             opacity: 0.8;
+        }
+
+        .btn-pause {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            color: var(--text-muted);
+            transition: all 0.1s;
+        }
+
+        .btn-pause:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-main);
+        }
+
+        .btn-pause.paused {
+            color: var(--warning);
+        }
+
+        .pause-badge {
+            background: var(--warning);
+            color: #000;
+            font-size: 10px;
+            padding: 1px 5px;
+            border-radius: 8px;
+            margin-left: 4px;
+            font-weight: 600;
+        }
+
+        .btn-theme {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            opacity: 0.5;
+            transition: opacity 0.1s;
+        }
+
+        .btn-theme:hover {
+            opacity: 0.8;
+        }
+
+        /* ===== KEYBOARD SHORTCUTS MODAL ===== */
+        .shortcuts-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .shortcuts-modal.visible {
+            display: flex;
+        }
+
+        .shortcuts-modal-content {
+            background: var(--bg-main);
+            border-radius: 8px;
+            padding: 24px;
+            border: 1px solid var(--border);
+            min-width: 400px;
+            max-width: 500px;
+        }
+
+        .shortcuts-modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .shortcuts-modal-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .shortcuts-modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 20px;
+        }
+
+        .shortcuts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px 24px;
+        }
+
+        .shortcut-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+        }
+
+        .shortcut-desc {
+            color: var(--text-secondary);
+        }
+
+        .shortcut-key {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-family: monospace;
+            font-size: 11px;
+            color: var(--text-main);
+        }
+
+        /* ===== LIGHT THEME ===== */
+        :root.light-theme {
+            --bg-main: #ffffff;
+            --bg-secondary: #f6f8fa;
+            --bg-tertiary: #f0f2f4;
+            --border: #d0d7de;
+            --text-main: #24292f;
+            --text-secondary: #57606a;
+            --text-muted: #8c959f;
+            --primary: #0969da;
+            --success: #1a7f37;
+            --error: #cf222e;
+            --warning: #9a6700;
+            --tree-line: #d0d7de;
         }
 
         .btn-notify {
@@ -2840,6 +3017,11 @@ const dashboardHTML = `
                     <span class="metrics-stat"><span id="req-rate">0</span> req/min</span>
                     <span class="metrics-stat"><span class="err" id="error-count">0</span> errors</span>
                 </div>
+                <div class="metrics-percentiles">
+                    <span>p50: <b id="p50-latency">--</b>ms</span>
+                    <span>p95: <b id="p95-latency">--</b>ms</span>
+                    <span>p99: <b id="p99-latency">--</b>ms</span>
+                </div>
             </div>
         </div>
 
@@ -2847,11 +3029,17 @@ const dashboardHTML = `
         <div class="traffic-header">
             <h1>Traffic</h1>
             <div class="traffic-header-actions">
+                <button class="btn-theme" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme">
+                    <span id="theme-icon">🌙</span>
+                </button>
                 <button class="btn-export-har" onclick="exportHAR()" title="Export as HAR file">
                     <span>📥</span>
                 </button>
                 <button class="btn-notify" id="btn-notify" onclick="toggleNotifications()" title="Enable desktop notifications for errors">
                     <span class="notify-icon">🔔</span>
+                </button>
+                <button class="btn-pause" id="btn-pause" onclick="togglePause()" title="Pause/resume live updates (Space)">
+                    <span id="pause-icon">⏸</span><span id="pause-badge" class="pause-badge" style="display:none">0</span>
                 </button>
                 <div class="traffic-live-badge" id="traffic-badge">
                     <div class="traffic-live-dot"></div>
@@ -3088,6 +3276,58 @@ const dashboardHTML = `
         </div>
     </div>
 
+    <!-- Keyboard Shortcuts Modal -->
+    <div id="shortcuts-modal" class="shortcuts-modal" onclick="closeShortcutsModal(event)">
+        <div class="shortcuts-modal-content" onclick="event.stopPropagation()">
+            <div class="shortcuts-modal-header">
+                <span class="shortcuts-modal-title">Keyboard Shortcuts</span>
+                <button class="shortcuts-modal-close" onclick="closeShortcutsModal()">&times;</button>
+            </div>
+            <div class="shortcuts-grid">
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Show shortcuts</span>
+                    <span class="shortcut-key">?</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">New tunnel</span>
+                    <span class="shortcut-key">N</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Focus filter</span>
+                    <span class="shortcut-key">Ctrl+K</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Close modal</span>
+                    <span class="shortcut-key">Esc</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Next request</span>
+                    <span class="shortcut-key">J</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Previous request</span>
+                    <span class="shortcut-key">K</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Replay request</span>
+                    <span class="shortcut-key">R</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Copy as cURL</span>
+                    <span class="shortcut-key">C</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Pause/resume</span>
+                    <span class="shortcut-key">Space</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Toggle theme</span>
+                    <span class="shortcut-key">T</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let tunnelsList = [];
@@ -3107,6 +3347,9 @@ const dashboardHTML = `
         let lastHeartbeat = null;
         let connectionStartTime = null;
         let notificationsEnabled = false;
+        let isPaused = false;
+        let pausedQueue = [];
+        let theme = localStorage.getItem('tunnel_theme') || 'dark';
 
         // ===== METRICS =====
 
@@ -3127,6 +3370,11 @@ const dashboardHTML = `
             document.getElementById('bytes-out').textContent = formatBytes(metricsData.total_bytes_out);
             document.getElementById('req-rate').textContent = Math.round(metricsData.requests_per_min);
             document.getElementById('error-count').textContent = metricsData.error_count;
+
+            // Update percentiles
+            document.getElementById('p50-latency').textContent = metricsData.p50_latency_ms || '--';
+            document.getElementById('p95-latency').textContent = metricsData.p95_latency_ms || '--';
+            document.getElementById('p99-latency').textContent = metricsData.p99_latency_ms || '--';
 
             renderLatencyChart(metricsData.latency_history || []);
             renderRateChart(metricsData.rate_history || []);
@@ -4126,7 +4374,12 @@ const dashboardHTML = `
             evtSource.addEventListener('request', function(e) {
                 try {
                     const req = JSON.parse(e.data);
-                    addRequest(req);
+                    if (isPaused) {
+                        pausedQueue.push(req);
+                        updatePauseBadge(pausedQueue.length);
+                    } else {
+                        addRequest(req);
+                    }
                 } catch (err) {
                     console.error('Failed to parse SSE:', err);
                 }
@@ -4237,6 +4490,100 @@ const dashboardHTML = `
             a.click();
             document.body.removeChild(a);
             showCopyToast('HAR file downloaded');
+        }
+
+        // ===== PAUSE/RESUME =====
+
+        function togglePause() {
+            isPaused = !isPaused;
+            updatePauseButton();
+
+            if (!isPaused && pausedQueue.length > 0) {
+                pausedQueue.forEach(r => {
+                    requestsMap[r.id] = r;
+                    requestsList.unshift(r);
+                });
+                pausedQueue = [];
+                filterRequests();
+                showCopyToast('Resumed - ' + requestsList.length + ' requests');
+            } else if (isPaused) {
+                showCopyToast('Paused - new requests will queue');
+            }
+        }
+
+        function updatePauseButton() {
+            const btn = document.getElementById('btn-pause');
+            const icon = document.getElementById('pause-icon');
+            const badge = document.getElementById('pause-badge');
+
+            if (isPaused) {
+                btn.classList.add('paused');
+                icon.textContent = '▶';
+                btn.title = 'Resume live updates (Space)';
+            } else {
+                btn.classList.remove('paused');
+                icon.textContent = '⏸';
+                btn.title = 'Pause live updates (Space)';
+                badge.style.display = 'none';
+            }
+        }
+
+        function updatePauseBadge(count) {
+            const badge = document.getElementById('pause-badge');
+            if (isPaused && count > 0) {
+                badge.textContent = count > 99 ? '99+' : count;
+                badge.style.display = 'inline';
+            } else {
+                badge.style.display = 'none';
+            }
+        }
+
+        // ===== THEME TOGGLE =====
+
+        function toggleTheme() {
+            theme = theme === 'dark' ? 'light' : 'dark';
+            applyTheme();
+            localStorage.setItem('tunnel_theme', theme);
+            showCopyToast(theme === 'dark' ? 'Dark theme' : 'Light theme');
+        }
+
+        function applyTheme() {
+            document.documentElement.classList.toggle('light-theme', theme === 'light');
+            const icon = document.getElementById('theme-icon');
+            icon.textContent = theme === 'dark' ? '🌙' : '☀️';
+        }
+
+        // ===== KEYBOARD SHORTCUTS =====
+
+        function showShortcutsModal() {
+            document.getElementById('shortcuts-modal').classList.add('visible');
+        }
+
+        function closeShortcutsModal(event) {
+            if (event && event.target !== event.currentTarget) return;
+            document.getElementById('shortcuts-modal').classList.remove('visible');
+        }
+
+        function isInputFocused() {
+            const el = document.activeElement;
+            return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT');
+        }
+
+        function navigateRequest(direction) {
+            if (filteredRequestsList.length === 0) return;
+
+            let currentIndex = -1;
+            if (selectedId) {
+                currentIndex = filteredRequestsList.findIndex(r => r.id === selectedId);
+            }
+
+            let newIndex = currentIndex + direction;
+            if (newIndex < 0) newIndex = 0;
+            if (newIndex >= filteredRequestsList.length) newIndex = filteredRequestsList.length - 1;
+
+            if (newIndex !== currentIndex) {
+                selectRequest(filteredRequestsList[newIndex].id);
+            }
         }
 
         function addRequest(r) {
@@ -4446,7 +4793,15 @@ const dashboardHTML = `
                 if (e.key === 'Escape') {
                     e.target.blur();
                     hideAddTunnelModal();
+                    closeShortcutsModal();
                 }
+                return;
+            }
+
+            // ? - Show shortcuts
+            if (e.key === '?') {
+                e.preventDefault();
+                showShortcutsModal();
                 return;
             }
 
@@ -4454,6 +4809,7 @@ const dashboardHTML = `
             if (e.key === 'n' || e.key === 'N') {
                 e.preventDefault();
                 showAddTunnelModal();
+                return;
             }
 
             // Ctrl+K or Cmd+K - Focus filter
@@ -4463,11 +4819,58 @@ const dashboardHTML = `
                 if (tunnelsList.length > 5) {
                     filter.focus();
                 }
+                return;
             }
 
-            // Escape - Close modal
+            // J - Next request
+            if (e.key === 'j') {
+                e.preventDefault();
+                navigateRequest(1);
+                return;
+            }
+
+            // K - Previous request
+            if (e.key === 'k') {
+                e.preventDefault();
+                navigateRequest(-1);
+                return;
+            }
+
+            // R - Replay request
+            if (e.key === 'r' && selectedId) {
+                e.preventDefault();
+                replayRequest();
+                return;
+            }
+
+            // C - Copy as cURL
+            if (e.key === 'c' && selectedId) {
+                e.preventDefault();
+                copyAsCurl();
+                return;
+            }
+
+            // Space - Pause/resume
+            if (e.key === ' ') {
+                e.preventDefault();
+                togglePause();
+                return;
+            }
+
+            // T - Toggle theme
+            if (e.key === 't') {
+                e.preventDefault();
+                toggleTheme();
+                return;
+            }
+
+            // Escape - Close modals
             if (e.key === 'Escape') {
                 hideAddTunnelModal();
+                closeShortcutsModal();
+                closeDiffModal();
+                closeQRModal();
+                closeWebhookModal();
             }
         });
 
@@ -4476,6 +4879,7 @@ const dashboardHTML = `
         loadInitial();
         initSSE();
         fetchMetrics();
+        applyTheme();
 
         // Update connection tooltip every 5 seconds
         setInterval(function() {
