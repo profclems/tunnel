@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,9 @@ import (
 
 	"github.com/google/uuid"
 )
+
+//go:embed dashboard.html
+var dashboardHTML string
 
 // RequestRecord holds details of a captured request
 type RequestRecord struct {
@@ -78,6 +82,52 @@ type MetricsSnapshot struct {
 	P50LatencyMs   int64          `json:"p50_latency_ms"`
 	P95LatencyMs   int64          `json:"p95_latency_ms"`
 	P99LatencyMs   int64          `json:"p99_latency_ms"`
+	ErrorsByStatus map[int]int64  `json:"errors_by_status"`
+	LatencyBuckets []int64        `json:"latency_buckets"` // Response time histogram
+}
+
+// MockRule defines a mock response rule
+type MockRule struct {
+	ID         string            `json:"id"`
+	Pattern    string            `json:"pattern"` // Glob pattern: /api/*, /users/:id
+	Method     string            `json:"method"`  // GET, POST, or * for any
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	Body       string            `json:"body"`
+	DelayMs    int               `json:"delay_ms"` // Simulate latency
+	Active     bool              `json:"active"`
+	HitCount   int64             `json:"hit_count"`
+	CreatedAt  time.Time         `json:"created_at"`
+}
+
+// SharedRequest represents a shareable captured request
+type SharedRequest struct {
+	Token     string         `json:"token"`
+	Request   *RequestRecord `json:"request"`
+	ExpiresAt time.Time      `json:"expires_at"`
+}
+
+// WSMessage represents a WebSocket message for inspection
+type WSMessage struct {
+	ID          string    `json:"id"`
+	TunnelID    string    `json:"tunnel_id"`
+	Direction   string    `json:"direction"`    // "in" (client->server) or "out" (server->client)
+	MessageType string    `json:"message_type"` // "text" or "binary"
+	Data        string    `json:"data"`
+	Size        int64     `json:"size"`
+	Timestamp   time.Time `json:"timestamp"`
+}
+
+// WSConnection represents an active WebSocket connection
+type WSConnection struct {
+	ID           string    `json:"id"`
+	TunnelID     string    `json:"tunnel_id"`
+	Path         string    `json:"path"`
+	StartedAt    time.Time `json:"started_at"`
+	MessageCount int64     `json:"message_count"`
+	BytesIn      int64     `json:"bytes_in"`
+	BytesOut     int64     `json:"bytes_out"`
+	Active       bool      `json:"active"`
 }
 
 // Inspector manages request introspection
@@ -102,6 +152,20 @@ type Inspector struct {
 
 	// Metrics tracking
 	metrics *InspectorMetrics
+
+	// Mock rules
+	mockRules   []*MockRule
+	mockRulesMu sync.RWMutex
+
+	// Shared requests
+	sharedRequests   map[string]*SharedRequest
+	sharedRequestsMu sync.RWMutex
+
+	// WebSocket tracking
+	wsMessages      []*WSMessage
+	wsConnections   map[string]*WSConnection
+	wsMessagesMu    sync.RWMutex
+	wsConnectionsMu sync.RWMutex
 }
 
 // SetClient sets the client reference for tunnel management
@@ -116,10 +180,14 @@ func (i *Inspector) SetConfigManager(cm *ConfigManager) {
 
 func NewInspector() *Inspector {
 	return &Inspector{
-		requests:   make([]*RequestRecord, 0),
-		maxSize:    100, // Keep last 100 requests
-		broadcast:  make(chan *RequestRecord, 10),
-		sseClients: make(map[chan *RequestRecord]struct{}),
+		requests:       make([]*RequestRecord, 0),
+		maxSize:        100, // Keep last 100 requests
+		broadcast:      make(chan *RequestRecord, 10),
+		sseClients:     make(map[chan *RequestRecord]struct{}),
+		mockRules:      make([]*MockRule, 0),
+		sharedRequests: make(map[string]*SharedRequest),
+		wsMessages:     make([]*WSMessage, 0),
+		wsConnections:  make(map[string]*WSConnection),
 		metrics: &InspectorMetrics{
 			latencyHistory: make([]LatencyPoint, 0, 60),
 			rateHistory:    make([]int, 60),
@@ -239,6 +307,214 @@ func (i *Inspector) recordMetrics(rec *RequestRecord) {
 	}
 }
 
+// findMatchingMock finds a mock rule that matches the request
+func (i *Inspector) findMatchingMock(method, path string) *MockRule {
+	i.mockRulesMu.RLock()
+	defer i.mockRulesMu.RUnlock()
+
+	for _, mock := range i.mockRules {
+		if !mock.Active {
+			continue
+		}
+		// Check method match
+		if mock.Method != "*" && mock.Method != "" && mock.Method != method {
+			continue
+		}
+		// Check pattern match (glob-style)
+		if matchPattern(mock.Pattern, path) {
+			return mock
+		}
+	}
+	return nil
+}
+
+// matchPattern matches a glob-style pattern against a path
+func matchPattern(pattern, path string) bool {
+	// Simple glob matching: * matches any segment, ** matches any segments
+	patternParts := strings.Split(strings.Trim(pattern, "/"), "/")
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+
+	pi := 0 // pattern index
+	for _, pp := range patternParts {
+		if pp == "**" {
+			// ** matches any remaining segments
+			return true
+		}
+		if pi >= len(pathParts) {
+			return false
+		}
+		if pp == "*" {
+			// * matches any single segment
+			pi++
+			continue
+		}
+		if strings.HasPrefix(pp, ":") {
+			// :param matches any single segment (path parameter)
+			pi++
+			continue
+		}
+		if pp != pathParts[pi] {
+			return false
+		}
+		pi++
+	}
+	return pi == len(pathParts)
+}
+
+// serveMockResponse writes a mock response and records it
+func (i *Inspector) serveMockResponse(stream net.Conn, rec *RequestRecord, mock *MockRule) {
+	// Simulate delay if configured
+	if mock.DelayMs > 0 {
+		time.Sleep(time.Duration(mock.DelayMs) * time.Millisecond)
+	}
+
+	// Increment hit count
+	i.mockRulesMu.Lock()
+	mock.HitCount++
+	i.mockRulesMu.Unlock()
+
+	// Build response
+	duration := time.Since(rec.Timestamp)
+	rec.Status = mock.StatusCode
+	rec.Duration = duration.String()
+	rec.DurationMs = duration.Milliseconds()
+	rec.ResBody = mock.Body
+	rec.ResBodySize = int64(len(mock.Body))
+	rec.ContentType = mock.Headers["Content-Type"]
+	rec.ResHeader = make(http.Header)
+	for k, v := range mock.Headers {
+		rec.ResHeader.Set(k, v)
+	}
+	rec.ResHeader.Set("X-Mock-ID", mock.ID)
+
+	// Record the mocked request
+	i.addRecord(rec)
+	i.recordMetrics(rec)
+
+	// Send response to client
+	resp := &http.Response{
+		StatusCode: mock.StatusCode,
+		Status:     fmt.Sprintf("%d %s", mock.StatusCode, http.StatusText(mock.StatusCode)),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     rec.ResHeader.Clone(),
+		Body:       io.NopCloser(strings.NewReader(mock.Body)),
+	}
+	if resp.Header.Get("Content-Type") == "" {
+		resp.Header.Set("Content-Type", "application/json")
+	}
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(mock.Body)))
+	resp.Write(stream)
+}
+
+// WebSocket tracking methods
+
+// TrackWSConnection registers a new WebSocket connection
+func (i *Inspector) TrackWSConnection(tunnelID, path string) string {
+	i.wsConnectionsMu.Lock()
+	defer i.wsConnectionsMu.Unlock()
+
+	id := uuid.New().String()[:8]
+	conn := &WSConnection{
+		ID:        id,
+		TunnelID:  tunnelID,
+		Path:      path,
+		StartedAt: time.Now(),
+		Active:    true,
+	}
+	i.wsConnections[id] = conn
+	return id
+}
+
+// CloseWSConnection marks a WebSocket connection as closed
+func (i *Inspector) CloseWSConnection(connID string) {
+	i.wsConnectionsMu.Lock()
+	defer i.wsConnectionsMu.Unlock()
+
+	if conn, exists := i.wsConnections[connID]; exists {
+		conn.Active = false
+	}
+}
+
+// TrackWSMessage records a WebSocket message
+func (i *Inspector) TrackWSMessage(connID, direction, msgType string, data []byte) {
+	i.wsMessagesMu.Lock()
+	defer i.wsMessagesMu.Unlock()
+
+	// Update connection stats
+	i.wsConnectionsMu.Lock()
+	if conn, exists := i.wsConnections[connID]; exists {
+		conn.MessageCount++
+		if direction == "in" {
+			conn.BytesIn += int64(len(data))
+		} else {
+			conn.BytesOut += int64(len(data))
+		}
+	}
+	i.wsConnectionsMu.Unlock()
+
+	// Truncate data for display if too large
+	dataStr := string(data)
+	if len(dataStr) > 4096 {
+		dataStr = dataStr[:4096] + "... (truncated)"
+	}
+
+	msg := &WSMessage{
+		ID:          uuid.New().String()[:8],
+		TunnelID:    connID,
+		Direction:   direction,
+		MessageType: msgType,
+		Data:        dataStr,
+		Size:        int64(len(data)),
+		Timestamp:   time.Now(),
+	}
+
+	i.wsMessages = append(i.wsMessages, msg)
+	if len(i.wsMessages) > 200 {
+		i.wsMessages = i.wsMessages[1:]
+	}
+}
+
+// GetWSMessages returns WebSocket messages, optionally filtered by connection
+func (i *Inspector) GetWSMessages(connID string) []*WSMessage {
+	i.wsMessagesMu.RLock()
+	defer i.wsMessagesMu.RUnlock()
+
+	if connID == "" {
+		result := make([]*WSMessage, len(i.wsMessages))
+		copy(result, i.wsMessages)
+		return result
+	}
+
+	var result []*WSMessage
+	for _, msg := range i.wsMessages {
+		if msg.TunnelID == connID {
+			result = append(result, msg)
+		}
+	}
+	return result
+}
+
+// GetWSConnections returns all WebSocket connections
+func (i *Inspector) GetWSConnections() []*WSConnection {
+	i.wsConnectionsMu.RLock()
+	defer i.wsConnectionsMu.RUnlock()
+
+	result := make([]*WSConnection, 0, len(i.wsConnections))
+	for _, conn := range i.wsConnections {
+		result = append(result, conn)
+	}
+	return result
+}
+
+// ClearWSMessages clears all WebSocket messages
+func (i *Inspector) ClearWSMessages() {
+	i.wsMessagesMu.Lock()
+	defer i.wsMessagesMu.Unlock()
+	i.wsMessages = make([]*WSMessage, 0)
+}
+
 // GetMetricsSnapshot returns a snapshot of current metrics
 func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 	i.metrics.mu.RLock()
@@ -258,12 +534,26 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 
 	// Calculate average latency and percentiles
 	var avgLatency, p50, p95, p99 int64
+	// Latency histogram buckets: <10ms, 10-25ms, 25-50ms, 50-100ms, 100-250ms, 250-500ms, 500ms-1s, 1-2.5s, 2.5-5s, >5s
+	latencyBuckets := make([]int64, 10)
+	bucketLimits := []int64{10, 25, 50, 100, 250, 500, 1000, 2500, 5000}
+
 	if len(latency) > 0 {
 		var total int64
 		sorted := make([]int64, len(latency))
 		for idx, p := range latency {
 			total += p.LatencyMs
 			sorted[idx] = p.LatencyMs
+
+			// Assign to histogram bucket
+			bucketIdx := len(bucketLimits) // Default to last bucket (>5s)
+			for bi, limit := range bucketLimits {
+				if p.LatencyMs < limit {
+					bucketIdx = bi
+					break
+				}
+			}
+			latencyBuckets[bucketIdx]++
 		}
 		avgLatency = total / int64(len(latency))
 
@@ -288,6 +578,16 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 	}
 	reqPerMin := float64(totalRate)
 
+	// Count errors by status code
+	i.mu.RLock()
+	errorsByStatus := make(map[int]int64)
+	for _, rec := range i.requests {
+		if rec.Status >= 400 {
+			errorsByStatus[rec.Status]++
+		}
+	}
+	i.mu.RUnlock()
+
 	return MetricsSnapshot{
 		LatencyHistory: latency,
 		RateHistory:    rateHistory,
@@ -300,6 +600,8 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 		P50LatencyMs:   p50,
 		P95LatencyMs:   p95,
 		P99LatencyMs:   p99,
+		ErrorsByStatus: errorsByStatus,
+		LatencyBuckets: latencyBuckets,
 	}
 }
 
@@ -381,6 +683,12 @@ func (i *Inspector) InspectHTTP(req *http.Request, stream net.Conn, localAddr st
 		ReqBody:     reqBody,
 		ReqBodySize: int64(len(reqBodyBytes)),
 		TunnelID:    tunnelID,
+	}
+
+	// Check for matching mock rule FIRST
+	if mock := i.findMatchingMock(req.Method, req.URL.Path); mock != nil {
+		i.serveMockResponse(stream, rec, mock)
+		return
 	}
 
 	// Modify request for forwarding to local service
@@ -998,6 +1306,245 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		json.NewEncoder(w).Encode(har)
 	})
 
+	// ========== MOCK RULES API ==========
+	mux.HandleFunc("/api/mocks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			i.mockRulesMu.RLock()
+			rules := make([]*MockRule, len(i.mockRules))
+			copy(rules, i.mockRules)
+			i.mockRulesMu.RUnlock()
+			json.NewEncoder(w).Encode(rules)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			var rule MockRule
+			if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+				return
+			}
+			rule.ID = uuid.New().String()[:8]
+			rule.CreatedAt = time.Now()
+			rule.Active = true
+
+			i.mockRulesMu.Lock()
+			i.mockRules = append(i.mockRules, &rule)
+			i.mockRulesMu.Unlock()
+
+			json.NewEncoder(w).Encode(rule)
+			return
+		}
+
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	})
+
+	mux.HandleFunc("/api/mocks/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "PUT, DELETE, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Extract mock ID and action from path: /api/mocks/{id} or /api/mocks/{id}/toggle
+		path := strings.TrimPrefix(r.URL.Path, "/api/mocks/")
+		parts := strings.Split(path, "/")
+		if len(parts) == 0 || parts[0] == "" {
+			http.Error(w, "Mock ID required", http.StatusBadRequest)
+			return
+		}
+		mockID := parts[0]
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+
+		i.mockRulesMu.Lock()
+		defer i.mockRulesMu.Unlock()
+
+		// Find mock by ID
+		var mockIdx = -1
+		for idx, m := range i.mockRules {
+			if m.ID == mockID {
+				mockIdx = idx
+				break
+			}
+		}
+		if mockIdx == -1 {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Mock not found"})
+			return
+		}
+
+		if action == "toggle" && r.Method == http.MethodPost {
+			i.mockRules[mockIdx].Active = !i.mockRules[mockIdx].Active
+			json.NewEncoder(w).Encode(i.mockRules[mockIdx])
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			var rule MockRule
+			if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+				return
+			}
+			rule.ID = mockID
+			rule.CreatedAt = i.mockRules[mockIdx].CreatedAt
+			rule.HitCount = i.mockRules[mockIdx].HitCount
+			i.mockRules[mockIdx] = &rule
+			json.NewEncoder(w).Encode(rule)
+			return
+		}
+
+		if r.Method == http.MethodDelete {
+			i.mockRules = append(i.mockRules[:mockIdx], i.mockRules[mockIdx+1:]...)
+			json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+			return
+		}
+
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	})
+
+	// ========== SHARE REQUEST API ==========
+	mux.HandleFunc("/api/share", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			RequestID string `json:"request_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+			return
+		}
+
+		rec := i.GetRequestByID(req.RequestID)
+		if rec == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Request not found"})
+			return
+		}
+
+		token := uuid.New().String()[:16]
+		shared := &SharedRequest{
+			Token:     token,
+			Request:   rec,
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+		}
+
+		i.sharedRequestsMu.Lock()
+		i.sharedRequests[token] = shared
+		i.sharedRequestsMu.Unlock()
+
+		json.NewEncoder(w).Encode(map[string]string{
+			"token":      token,
+			"expires_at": shared.ExpiresAt.Format(time.RFC3339),
+		})
+	})
+
+	mux.HandleFunc("/api/shared/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		token := strings.TrimPrefix(r.URL.Path, "/api/shared/")
+		if token == "" {
+			http.Error(w, "Token required", http.StatusBadRequest)
+			return
+		}
+
+		i.sharedRequestsMu.RLock()
+		shared, exists := i.sharedRequests[token]
+		i.sharedRequestsMu.RUnlock()
+
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Shared request not found or expired"})
+			return
+		}
+
+		if time.Now().After(shared.ExpiresAt) {
+			i.sharedRequestsMu.Lock()
+			delete(i.sharedRequests, token)
+			i.sharedRequestsMu.Unlock()
+			w.WriteHeader(http.StatusGone)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Shared request has expired"})
+			return
+		}
+
+		json.NewEncoder(w).Encode(shared)
+	})
+
+	// ========== WEBSOCKET INSPECTOR API ==========
+	mux.HandleFunc("/api/ws-connections", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		connections := i.GetWSConnections()
+		json.NewEncoder(w).Encode(connections)
+	})
+
+	mux.HandleFunc("/api/ws-messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		connID := r.URL.Query().Get("connection_id")
+		messages := i.GetWSMessages(connID)
+		json.NewEncoder(w).Encode(messages)
+	})
+
+	mux.HandleFunc("/api/ws-messages/clear", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		i.ClearWSMessages()
+		json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(dashboardHTML))
 	})
@@ -1026,3869 +1573,3 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 	defer cancel()
 	server.Shutdown(shutdownCtx)
 }
-
-const dashboardHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tunnel Inspector</title>
-    <style>
-        :root {
-            --bg: #0d1117;
-            --bg-secondary: #161b22;
-            --bg-tertiary: #21262d;
-            --border: #30363d;
-            --border-light: #3d444d;
-            --text-main: #e6edf3;
-            --text-secondary: #8b949e;
-            --text-muted: #6e7681;
-            --primary: #58a6ff;
-            --primary-hover: #79b8ff;
-            --success: #3fb950;
-            --success-muted: #238636;
-            --error: #f85149;
-            --warning: #d29922;
-            --http-badge: #58a6ff;
-            --tcp-badge: #3fb950;
-            --code-bg: #161b22;
-            --tree-line: #30363d;
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-            background: var(--bg);
-            color: var(--text-main);
-            height: 100vh;
-            display: flex;
-            overflow: hidden;
-            font-size: 13px;
-        }
-
-        /* Monospace for code-like elements */
-        .mono { font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace; }
-
-        /* Layout */
-        .sidebar {
-            width: 420px;
-            background: var(--bg-secondary);
-            border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-        }
-        .main {
-            flex: 1;
-            background: var(--bg);
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        /* ===== TUNNEL SECTION ===== */
-        .tunnel-panel {
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-        }
-
-        .tunnel-panel-header {
-            padding: 12px 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: var(--bg-tertiary);
-            border-bottom: 1px solid var(--border);
-            cursor: pointer;
-            user-select: none;
-        }
-
-        .tunnel-panel-header:hover {
-            background: #282e36;
-        }
-
-        .tunnel-panel-title {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-weight: 600;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-secondary);
-        }
-
-        .tunnel-panel-title .chevron {
-            transition: transform 0.15s ease;
-            color: var(--text-muted);
-        }
-
-        .tunnel-panel.collapsed .chevron {
-            transform: rotate(-90deg);
-        }
-
-        .tunnel-count {
-            background: var(--primary);
-            color: var(--bg);
-            font-size: 10px;
-            font-weight: 700;
-            padding: 2px 6px;
-            border-radius: 10px;
-            min-width: 18px;
-            text-align: center;
-        }
-
-        .tunnel-status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: var(--success);
-            box-shadow: 0 0 6px var(--success);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-
-        .tunnel-status-dot.disconnected {
-            background: var(--error);
-            box-shadow: 0 0 6px var(--error);
-            animation: none;
-        }
-
-        .tunnel-panel-actions {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .btn-new-tunnel {
-            background: var(--success-muted);
-            color: var(--text-main);
-            border: none;
-            padding: 5px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: 500;
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            transition: background 0.15s;
-        }
-
-        .btn-new-tunnel:hover {
-            background: var(--success);
-        }
-
-        .kbd {
-            font-family: 'SF Mono', monospace;
-            font-size: 10px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 3px;
-            padding: 1px 5px;
-            color: var(--text-muted);
-        }
-
-        .tunnel-panel-body {
-            max-height: 350px;
-            overflow-y: auto;
-            transition: max-height 0.2s ease;
-        }
-
-        .tunnel-panel.collapsed .tunnel-panel-body {
-            max-height: 0;
-            overflow: hidden;
-        }
-
-        /* Filter */
-        .tunnel-filter {
-            padding: 8px 12px;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border);
-            display: none;
-        }
-
-        .tunnel-filter.visible {
-            display: block;
-        }
-
-        .tunnel-filter-input {
-            width: 100%;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 6px 10px;
-            color: var(--text-main);
-            font-size: 12px;
-            font-family: 'SF Mono', monospace;
-        }
-
-        .tunnel-filter-input:focus {
-            outline: none;
-            border-color: var(--primary);
-        }
-
-        .tunnel-filter-input::placeholder {
-            color: var(--text-muted);
-        }
-
-        /* Tunnel Groups */
-        .tunnel-group {
-            border-bottom: 1px solid var(--border);
-        }
-
-        .tunnel-group:last-child {
-            border-bottom: none;
-        }
-
-        .tunnel-group-header {
-            padding: 8px 16px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-            background: var(--bg-secondary);
-            user-select: none;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-muted);
-        }
-
-        .tunnel-group-header:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .tunnel-group-header .chevron {
-            font-size: 10px;
-            transition: transform 0.15s ease;
-        }
-
-        .tunnel-group.collapsed .tunnel-group-header .chevron {
-            transform: rotate(-90deg);
-        }
-
-        .tunnel-group-header .line {
-            flex: 1;
-            height: 1px;
-            background: var(--border);
-        }
-
-        .tunnel-group-header .count {
-            color: var(--text-secondary);
-            font-weight: 400;
-        }
-
-        .tunnel-group-body {
-            padding: 4px 0 8px 0;
-        }
-
-        .tunnel-group.collapsed .tunnel-group-body {
-            display: none;
-        }
-
-        /* Tunnel Items with Tree */
-        .tunnel-tree {
-            padding-left: 16px;
-        }
-
-        .tunnel-item {
-            display: flex;
-            align-items: flex-start;
-            padding: 6px 16px 6px 0;
-            position: relative;
-        }
-
-        .tunnel-item:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .tree-connector {
-            width: 24px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            color: var(--tree-line);
-            font-family: monospace;
-            flex-shrink: 0;
-            padding-top: 2px;
-        }
-
-        .tree-connector .line {
-            color: var(--tree-line);
-            font-size: 14px;
-            line-height: 1;
-        }
-
-        .tunnel-content {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .tunnel-main-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .tunnel-status {
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: var(--success);
-            flex-shrink: 0;
-        }
-
-        .tunnel-status.connecting {
-            background: var(--warning);
-            animation: pulse 1s infinite;
-        }
-
-        .tunnel-status.error {
-            background: var(--error);
-        }
-
-        .tunnel-url {
-            font-family: 'SF Mono', monospace;
-            font-size: 12px;
-            color: var(--text-main);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            flex: 1;
-        }
-
-        .tunnel-actions {
-            display: flex;
-            gap: 2px;
-            opacity: 0;
-            transition: opacity 0.1s;
-        }
-
-        .tunnel-item:hover .tunnel-actions {
-            opacity: 1;
-        }
-
-        .tunnel-action-btn {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            padding: 4px 6px;
-            border-radius: 3px;
-            font-size: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.1s;
-        }
-
-        .tunnel-action-btn:hover {
-            background: var(--bg-tertiary);
-            color: var(--text-main);
-        }
-
-        .tunnel-action-btn.copy-success {
-            color: var(--success);
-        }
-
-        .tunnel-action-btn.remove:hover {
-            color: var(--error);
-        }
-
-        /* ===== QR CODE MODAL ===== */
-        .qr-modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .qr-modal.visible {
-            display: flex;
-        }
-
-        .qr-modal-content {
-            background: var(--bg-main);
-            border-radius: 8px;
-            padding: 24px;
-            text-align: center;
-            border: 1px solid var(--border);
-            min-width: 280px;
-        }
-
-        .qr-modal-title {
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 16px;
-        }
-
-        .qr-container {
-            background: white;
-            padding: 16px;
-            border-radius: 8px;
-            display: inline-block;
-            margin-bottom: 16px;
-        }
-
-        .qr-container canvas {
-            display: block;
-        }
-
-        .qr-url {
-            font-size: 12px;
-            color: var(--text-secondary);
-            word-break: break-all;
-            max-width: 250px;
-            margin: 0 auto 16px;
-        }
-
-        .qr-modal-close {
-            padding: 8px 16px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            cursor: pointer;
-            font-size: 12px;
-        }
-
-        .qr-modal-close:hover {
-            background: var(--border);
-        }
-
-        /* ===== WEBHOOK TESTER ===== */
-        .webhook-modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .webhook-modal.visible {
-            display: flex;
-        }
-
-        .webhook-modal-content {
-            background: var(--bg-main);
-            border-radius: 8px;
-            width: 600px;
-            max-height: 90vh;
-            display: flex;
-            flex-direction: column;
-            border: 1px solid var(--border);
-        }
-
-        .webhook-modal-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .webhook-modal-title {
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        .webhook-modal-close {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            font-size: 20px;
-        }
-
-        .webhook-form {
-            padding: 20px;
-            overflow-y: auto;
-        }
-
-        .webhook-row {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-
-        .webhook-method {
-            width: 100px;
-            padding: 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-size: 12px;
-        }
-
-        .webhook-url {
-            flex: 1;
-            padding: 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-size: 12px;
-        }
-
-        .webhook-label {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-            text-transform: uppercase;
-        }
-
-        .webhook-headers {
-            width: 100%;
-            height: 80px;
-            padding: 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-family: monospace;
-            font-size: 12px;
-            resize: vertical;
-            margin-bottom: 12px;
-        }
-
-        .webhook-body {
-            width: 100%;
-            height: 120px;
-            padding: 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-family: monospace;
-            font-size: 12px;
-            resize: vertical;
-            margin-bottom: 16px;
-        }
-
-        .webhook-actions {
-            display: flex;
-            gap: 8px;
-            justify-content: flex-end;
-        }
-
-        .btn-webhook-send {
-            padding: 8px 16px;
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 500;
-        }
-
-        .btn-webhook-send:hover {
-            background: #4a9eff;
-        }
-
-        .btn-webhook-send:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .webhook-response {
-            margin-top: 16px;
-            padding-top: 16px;
-            border-top: 1px solid var(--border);
-            display: none;
-        }
-
-        .webhook-response.visible {
-            display: block;
-        }
-
-        .webhook-response-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-
-        .webhook-response-status {
-            font-weight: 600;
-            font-size: 13px;
-        }
-
-        .webhook-response-status.success {
-            color: var(--success);
-        }
-
-        .webhook-response-status.error {
-            color: var(--error);
-        }
-
-        .webhook-response-time {
-            font-size: 11px;
-            color: var(--text-muted);
-        }
-
-        .webhook-response-body {
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            padding: 12px;
-            font-family: monospace;
-            font-size: 11px;
-            max-height: 200px;
-            overflow: auto;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-
-        .tunnel-local-row {
-            display: flex;
-            align-items: center;
-            padding-left: 14px;
-            margin-top: 2px;
-        }
-
-        .tree-elbow {
-            color: var(--tree-line);
-            font-family: monospace;
-            font-size: 12px;
-            margin-right: 6px;
-        }
-
-        .tunnel-arrow {
-            color: var(--text-muted);
-            margin-right: 6px;
-            font-size: 11px;
-        }
-
-        .tunnel-local {
-            font-family: 'SF Mono', monospace;
-            font-size: 11px;
-            color: var(--text-secondary);
-        }
-
-        /* Empty State */
-        .tunnel-empty {
-            padding: 32px 16px;
-            text-align: center;
-            color: var(--text-muted);
-        }
-
-        .tunnel-empty-icon {
-            font-size: 32px;
-            margin-bottom: 12px;
-            opacity: 0.5;
-        }
-
-        .tunnel-empty-title {
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-        }
-
-        .tunnel-empty-hint {
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-bottom: 16px;
-        }
-
-        .btn-empty-add {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            color: var(--text-main);
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            transition: all 0.15s;
-        }
-
-        .btn-empty-add:hover {
-            background: var(--primary);
-            border-color: var(--primary);
-        }
-
-        /* Footer Status Bar */
-        .tunnel-footer {
-            padding: 8px 16px;
-            background: var(--bg);
-            border-top: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-muted);
-        }
-
-        .tunnel-footer-left {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .tunnel-footer-status {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .tunnel-footer-right {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .tunnel-footer-config {
-            font-family: 'SF Mono', monospace;
-            color: var(--text-secondary);
-            max-width: 200px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .btn-reload {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            padding: 2px;
-            font-size: 14px;
-            transition: color 0.15s;
-        }
-
-        .btn-reload:hover {
-            color: var(--text-main);
-        }
-
-        /* ===== METRICS PANEL ===== */
-        .metrics-panel {
-            padding: 12px 16px;
-            border-bottom: 1px solid var(--border);
-            background: var(--bg-secondary);
-        }
-
-        .metrics-panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 10px;
-            cursor: pointer;
-        }
-
-        .metrics-panel-title {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-secondary);
-        }
-
-        .metrics-charts {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 8px;
-        }
-
-        .metrics-chart-container {
-            flex: 1;
-        }
-
-        .metrics-chart-label {
-            font-size: 9px;
-            color: var(--text-muted);
-            margin-bottom: 4px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .metrics-chart {
-            height: 40px;
-            background: var(--bg-tertiary);
-            border-radius: 4px;
-            overflow: hidden;
-        }
-
-        .metrics-chart svg {
-            width: 100%;
-            height: 100%;
-        }
-
-        .rate-bar {
-            fill: var(--primary);
-            opacity: 0.7;
-        }
-
-        .rate-bar:last-child {
-            opacity: 1;
-        }
-
-        .metrics-stats {
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-secondary);
-        }
-
-        .metrics-percentiles {
-            display: flex;
-            justify-content: space-around;
-            font-size: 10px;
-            color: var(--text-muted);
-            margin-top: 8px;
-            padding-top: 8px;
-            border-top: 1px solid var(--border);
-        }
-
-        .metrics-percentiles span {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        .metrics-percentiles b {
-            color: var(--text-secondary);
-            font-weight: 600;
-        }
-
-        .metrics-stat {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        .metrics-stat .down { color: var(--success); }
-        .metrics-stat .up { color: var(--primary); }
-        .metrics-stat .err { color: var(--error); }
-
-        /* ===== FILTER BAR ===== */
-        .filter-bar {
-            padding: 8px 16px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            gap: 8px;
-            background: var(--bg-secondary);
-        }
-
-        .filter-input {
-            flex: 1;
-            padding: 6px 10px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-size: 12px;
-        }
-
-        .filter-input:focus {
-            outline: none;
-            border-color: var(--primary);
-        }
-
-        .filter-input::placeholder {
-            color: var(--text-muted);
-        }
-
-        .filter-select {
-            padding: 6px 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            color: var(--text-main);
-            font-size: 12px;
-            cursor: pointer;
-        }
-
-        .filter-select:focus {
-            outline: none;
-            border-color: var(--primary);
-        }
-
-        /* ===== SYNTAX HIGHLIGHTING ===== */
-        .json-key { color: #79b8ff; }
-        .json-string { color: #a5d6ff; }
-        .json-number { color: #f0883e; }
-        .json-bool { color: #ff7b72; }
-        .json-null { color: #ff7b72; }
-        .xml-tag { color: #7ee787; }
-        .xml-attr { color: #79b8ff; }
-
-        /* ===== TRAFFIC SECTION ===== */
-        .traffic-header {
-            padding: 12px 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            border-bottom: 1px solid var(--border);
-            background: var(--bg-tertiary);
-        }
-
-        .traffic-header h1 {
-            font-size: 12px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-secondary);
-        }
-
-        .traffic-header-actions {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .btn-export-har {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            opacity: 0.5;
-            transition: opacity 0.1s;
-        }
-
-        .btn-export-har:hover {
-            opacity: 0.8;
-        }
-
-        .btn-pause {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            color: var(--text-muted);
-            transition: all 0.1s;
-        }
-
-        .btn-pause:hover {
-            background: var(--bg-tertiary);
-            color: var(--text-main);
-        }
-
-        .btn-pause.paused {
-            color: var(--warning);
-        }
-
-        .pause-badge {
-            background: var(--warning);
-            color: #000;
-            font-size: 10px;
-            padding: 1px 5px;
-            border-radius: 8px;
-            margin-left: 4px;
-            font-weight: 600;
-        }
-
-        .btn-theme {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            opacity: 0.5;
-            transition: opacity 0.1s;
-        }
-
-        .btn-theme:hover {
-            opacity: 0.8;
-        }
-
-        /* ===== KEYBOARD SHORTCUTS MODAL ===== */
-        .shortcuts-modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .shortcuts-modal.visible {
-            display: flex;
-        }
-
-        .shortcuts-modal-content {
-            background: var(--bg-main);
-            border-radius: 8px;
-            padding: 24px;
-            border: 1px solid var(--border);
-            min-width: 400px;
-            max-width: 500px;
-        }
-
-        .shortcuts-modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .shortcuts-modal-title {
-            font-size: 16px;
-            font-weight: 600;
-        }
-
-        .shortcuts-modal-close {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            font-size: 20px;
-        }
-
-        .shortcuts-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px 24px;
-        }
-
-        .shortcut-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 12px;
-        }
-
-        .shortcut-desc {
-            color: var(--text-secondary);
-        }
-
-        .shortcut-key {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 2px 8px;
-            font-family: monospace;
-            font-size: 11px;
-            color: var(--text-main);
-        }
-
-        /* ===== LIGHT THEME ===== */
-        :root.light-theme {
-            --bg-main: #ffffff;
-            --bg-secondary: #f6f8fa;
-            --bg-tertiary: #f0f2f4;
-            --border: #d0d7de;
-            --text-main: #24292f;
-            --text-secondary: #57606a;
-            --text-muted: #8c959f;
-            --primary: #0969da;
-            --success: #1a7f37;
-            --error: #cf222e;
-            --warning: #9a6700;
-            --tree-line: #d0d7de;
-        }
-
-        .btn-notify {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            opacity: 0.5;
-            transition: opacity 0.1s;
-        }
-
-        .btn-notify:hover {
-            opacity: 0.8;
-        }
-
-        .btn-notify.active {
-            opacity: 1;
-        }
-
-        .btn-notify.active .notify-icon {
-            animation: bell-ring 0.5s ease;
-        }
-
-        @keyframes bell-ring {
-            0%, 100% { transform: rotate(0); }
-            25% { transform: rotate(15deg); }
-            75% { transform: rotate(-15deg); }
-        }
-
-        .traffic-live-badge {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 11px;
-            padding: 3px 8px;
-            border-radius: 12px;
-            background: rgba(63, 185, 80, 0.15);
-            color: var(--success);
-        }
-
-        .traffic-live-dot {
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: var(--success);
-            animation: pulse 2s infinite;
-        }
-
-        .traffic-live-badge.reconnecting {
-            background: rgba(210, 153, 34, 0.15);
-            color: var(--warning);
-        }
-
-        .traffic-live-badge.reconnecting .traffic-live-dot {
-            background: var(--warning);
-        }
-
-        /* Request List */
-        .req-list {
-            flex: 1;
-            overflow-y: auto;
-        }
-
-        .req-item {
-            padding: 10px 16px;
-            border-bottom: 1px solid var(--border);
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            transition: background 0.1s;
-        }
-
-        .req-item:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .req-item.active {
-            background: rgba(88, 166, 255, 0.1);
-            border-left: 2px solid var(--primary);
-        }
-
-        .req-status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            flex-shrink: 0;
-        }
-
-        .req-status-dot.s-2xx { background: var(--success); }
-        .req-status-dot.s-4xx { background: var(--warning); }
-        .req-status-dot.s-5xx { background: var(--error); }
-
-        .req-info {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .req-main {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 3px;
-        }
-
-        .req-method {
-            font-family: 'SF Mono', monospace;
-            font-size: 10px;
-            font-weight: 700;
-            padding: 2px 4px;
-            border-radius: 3px;
-            background: var(--bg-tertiary);
-            color: var(--text-secondary);
-        }
-
-        .req-method.s-2xx { color: var(--success); }
-        .req-method.s-4xx { color: var(--warning); }
-        .req-method.s-5xx { color: var(--error); }
-
-        .req-path {
-            font-family: 'SF Mono', monospace;
-            font-size: 12px;
-            color: var(--text-main);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .req-meta {
-            display: flex;
-            gap: 12px;
-            font-size: 11px;
-            color: var(--text-muted);
-        }
-
-        /* ===== DETAIL VIEW ===== */
-        .empty-state {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            color: var(--text-muted);
-            gap: 8px;
-        }
-
-        .empty-state-icon {
-            font-size: 48px;
-            opacity: 0.3;
-        }
-
-        .detail-view {
-            display: none;
-            flex-direction: column;
-            height: 100%;
-        }
-
-        .detail-view.visible {
-            display: flex;
-        }
-
-        .detail-header {
-            padding: 16px 24px;
-            border-bottom: 1px solid var(--border);
-            background: var(--bg-secondary);
-        }
-
-        .detail-title {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-
-        .detail-method {
-            font-family: 'SF Mono', monospace;
-            font-size: 12px;
-            font-weight: 700;
-            padding: 3px 8px;
-            border-radius: 4px;
-            background: var(--bg-tertiary);
-        }
-
-        .detail-path {
-            font-family: 'SF Mono', monospace;
-            font-size: 14px;
-            color: var(--text-main);
-        }
-
-        .detail-meta {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        .detail-status {
-            font-weight: 600;
-        }
-
-        .detail-status.s-2xx { color: var(--success); }
-        .detail-status.s-4xx { color: var(--warning); }
-        .detail-status.s-5xx { color: var(--error); }
-
-        .btn-replay {
-            background: var(--primary);
-            color: var(--bg);
-            border: none;
-            padding: 5px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: 600;
-            margin-left: auto;
-            transition: background 0.15s;
-        }
-
-        .btn-replay:hover {
-            background: var(--primary-hover);
-        }
-
-        .btn-replay:disabled {
-            background: var(--bg-tertiary);
-            color: var(--text-muted);
-            cursor: not-allowed;
-        }
-
-        .export-dropdown {
-            position: relative;
-            display: inline-block;
-        }
-
-        .btn-export {
-            background: var(--bg-tertiary);
-            color: var(--text-main);
-            border: 1px solid var(--border);
-            padding: 5px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: 500;
-            transition: all 0.15s;
-        }
-
-        .btn-export:hover {
-            background: var(--border);
-        }
-
-        .export-menu {
-            display: none;
-            position: absolute;
-            top: 100%;
-            right: 0;
-            margin-top: 4px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            min-width: 140px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-            z-index: 100;
-        }
-
-        .export-menu.visible {
-            display: block;
-        }
-
-        .export-option {
-            padding: 8px 12px;
-            cursor: pointer;
-            font-size: 12px;
-            transition: background 0.1s;
-        }
-
-        .export-option:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .export-option:first-child {
-            border-radius: 6px 6px 0 0;
-        }
-
-        .export-option:last-child {
-            border-radius: 0 0 6px 6px;
-        }
-
-        .copy-toast {
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: var(--success);
-            color: white;
-            padding: 8px 16px;
-            border-radius: 4px;
-            font-size: 12px;
-            z-index: 1000;
-            opacity: 0;
-            transition: opacity 0.2s;
-        }
-
-        .copy-toast.visible {
-            opacity: 1;
-        }
-
-        .replay-result {
-            margin-top: 12px;
-            padding: 10px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            display: none;
-        }
-
-        .replay-result.visible {
-            display: block;
-        }
-
-        .replay-result.success {
-            background: rgba(63, 185, 80, 0.1);
-            border: 1px solid rgba(63, 185, 80, 0.3);
-            color: var(--success);
-        }
-
-        .replay-result.error {
-            background: rgba(248, 81, 73, 0.1);
-            border: 1px solid rgba(248, 81, 73, 0.3);
-            color: var(--error);
-        }
-
-        /* ===== DIFF COMPARISON ===== */
-        .diff-checkbox {
-            width: 14px;
-            height: 14px;
-            cursor: pointer;
-            accent-color: var(--primary);
-            flex-shrink: 0;
-        }
-
-        .diff-checkbox:checked + .req-status-dot {
-            margin-left: 0;
-        }
-
-        .compare-bar {
-            padding: 8px 16px;
-            background: rgba(88, 166, 255, 0.1);
-            border-bottom: 1px solid var(--primary);
-            display: none;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 12px;
-        }
-
-        .compare-bar.visible {
-            display: flex;
-        }
-
-        .compare-bar-info {
-            color: var(--text-secondary);
-        }
-
-        .compare-bar-actions {
-            display: flex;
-            gap: 8px;
-        }
-
-        .btn-compare {
-            padding: 4px 12px;
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: 500;
-        }
-
-        .btn-compare:hover {
-            background: #4a9eff;
-        }
-
-        .btn-clear-compare {
-            padding: 4px 12px;
-            background: transparent;
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-        }
-
-        .btn-clear-compare:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .diff-modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .diff-modal.visible {
-            display: flex;
-        }
-
-        .diff-modal-content {
-            background: var(--bg-main);
-            border-radius: 8px;
-            width: 95%;
-            max-width: 1400px;
-            max-height: 90vh;
-            display: flex;
-            flex-direction: column;
-            border: 1px solid var(--border);
-        }
-
-        .diff-modal-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .diff-modal-title {
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        .diff-modal-close {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            font-size: 20px;
-            padding: 4px 8px;
-        }
-
-        .diff-modal-close:hover {
-            color: var(--text-main);
-        }
-
-        .diff-tabs {
-            display: flex;
-            gap: 0;
-            padding: 0 20px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .diff-tab {
-            padding: 10px 16px;
-            cursor: pointer;
-            font-size: 12px;
-            color: var(--text-muted);
-            border-bottom: 2px solid transparent;
-            margin-bottom: -1px;
-        }
-
-        .diff-tab:hover {
-            color: var(--text-main);
-        }
-
-        .diff-tab.active {
-            color: var(--primary);
-            border-bottom-color: var(--primary);
-        }
-
-        .diff-body {
-            flex: 1;
-            overflow: hidden;
-            display: flex;
-        }
-
-        .diff-pane {
-            flex: 1;
-            overflow: auto;
-            padding: 16px;
-        }
-
-        .diff-pane:first-child {
-            border-right: 1px solid var(--border);
-        }
-
-        .diff-pane-header {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            color: var(--text-muted);
-            margin-bottom: 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .diff-line {
-            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-            font-size: 12px;
-            line-height: 1.6;
-            padding: 2px 8px;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-
-        .diff-line.added {
-            background: rgba(63, 185, 80, 0.15);
-            color: var(--success);
-        }
-
-        .diff-line.removed {
-            background: rgba(248, 81, 73, 0.15);
-            color: var(--error);
-        }
-
-        .diff-line.unchanged {
-            color: var(--text-secondary);
-        }
-
-        .detail-content {
-            flex: 1;
-            overflow-y: auto;
-            padding: 20px 24px;
-        }
-
-        .detail-section {
-            margin-bottom: 24px;
-        }
-
-        .section-title {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-muted);
-            margin-bottom: 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .tabs {
-            display: flex;
-            gap: 0;
-            margin-bottom: 12px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .tab {
-            padding: 8px 16px;
-            cursor: pointer;
-            font-size: 12px;
-            color: var(--text-secondary);
-            border-bottom: 2px solid transparent;
-            margin-bottom: -1px;
-            transition: all 0.15s;
-        }
-
-        .tab:hover {
-            color: var(--text-main);
-        }
-
-        .tab.active {
-            color: var(--primary);
-            border-bottom-color: var(--primary);
-        }
-
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        .kv-grid {
-            display: grid;
-            grid-template-columns: auto 1fr;
-            gap: 6px 16px;
-            font-size: 12px;
-        }
-
-        .kv-key {
-            font-family: 'SF Mono', monospace;
-            color: var(--text-muted);
-            text-align: right;
-        }
-
-        .kv-val {
-            font-family: 'SF Mono', monospace;
-            color: var(--text-main);
-            word-break: break-all;
-        }
-
-        pre {
-            margin: 0;
-            padding: 16px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            font-family: 'SF Mono', monospace;
-            font-size: 11px;
-            color: var(--text-main);
-            overflow-x: auto;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-
-        /* ===== MODAL ===== */
-        .modal-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .modal-overlay.visible {
-            display: flex;
-        }
-
-        .modal {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            width: 400px;
-            max-width: 90vw;
-            box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
-        }
-
-        .modal-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .modal-header h2 {
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text-main);
-        }
-
-        .modal-close {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            font-size: 18px;
-            padding: 4px;
-            line-height: 1;
-            transition: color 0.15s;
-        }
-
-        .modal-close:hover {
-            color: var(--text-main);
-        }
-
-        .modal-body {
-            padding: 20px;
-        }
-
-        .form-group {
-            margin-bottom: 16px;
-        }
-
-        .form-label {
-            display: block;
-            font-size: 12px;
-            font-weight: 500;
-            color: var(--text-secondary);
-            margin-bottom: 6px;
-        }
-
-        .form-input,
-        .form-select {
-            width: 100%;
-            padding: 8px 12px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            color: var(--text-main);
-            font-size: 13px;
-            font-family: 'SF Mono', monospace;
-            transition: border-color 0.15s;
-        }
-
-        .form-input:focus,
-        .form-select:focus {
-            outline: none;
-            border-color: var(--primary);
-        }
-
-        .form-input::placeholder {
-            color: var(--text-muted);
-        }
-
-        .form-hint {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-top: 4px;
-        }
-
-        .form-preview {
-            font-size: 11px;
-            color: var(--primary);
-            margin-top: 4px;
-            font-family: 'SF Mono', monospace;
-        }
-
-        .form-type-selector {
-            display: flex;
-            gap: 8px;
-        }
-
-        .form-type-option {
-            flex: 1;
-            padding: 10px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            cursor: pointer;
-            text-align: center;
-            transition: all 0.15s;
-        }
-
-        .form-type-option:hover {
-            border-color: var(--primary);
-        }
-
-        .form-type-option.selected {
-            border-color: var(--primary);
-            background: rgba(88, 166, 255, 0.1);
-        }
-
-        .form-type-option input {
-            display: none;
-        }
-
-        .form-type-option .type-label {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-main);
-        }
-
-        .form-type-option .type-desc {
-            font-size: 10px;
-            color: var(--text-muted);
-            margin-top: 2px;
-        }
-
-        .form-checkbox {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-        }
-
-        .form-checkbox input {
-            width: 14px;
-            height: 14px;
-            accent-color: var(--primary);
-        }
-
-        .form-checkbox span {
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        .modal-footer {
-            padding: 16px 20px;
-            border-top: 1px solid var(--border);
-            display: flex;
-            justify-content: flex-end;
-            gap: 8px;
-        }
-
-        .btn-modal-cancel {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            color: var(--text-secondary);
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            transition: all 0.15s;
-        }
-
-        .btn-modal-cancel:hover {
-            background: var(--bg);
-            color: var(--text-main);
-        }
-
-        .btn-modal-submit {
-            background: var(--primary);
-            border: none;
-            color: var(--bg);
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            transition: background 0.15s;
-        }
-
-        .btn-modal-submit:hover {
-            background: var(--primary-hover);
-        }
-
-        .btn-modal-submit:disabled {
-            background: var(--bg-tertiary);
-            color: var(--text-muted);
-            cursor: not-allowed;
-        }
-
-        /* Scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: var(--border);
-            border-radius: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: var(--border-light);
-        }
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <!-- Tunnel Panel -->
-        <div class="tunnel-panel" id="tunnel-panel">
-            <div class="tunnel-panel-header" onclick="toggleTunnelPanel()">
-                <div class="tunnel-panel-title">
-                    <span class="chevron">▼</span>
-                    <span>Tunnels</span>
-                    <span class="tunnel-count" id="tunnel-count">0</span>
-                </div>
-                <div class="tunnel-panel-actions" onclick="event.stopPropagation()">
-                    <div class="tunnel-status-dot" id="connection-status" title="Connected"></div>
-                    <button class="btn-new-tunnel" onclick="showAddTunnelModal()" title="Add new tunnel">
-                        <span>+</span> New
-                        <span class="kbd">N</span>
-                    </button>
-                </div>
-            </div>
-
-            <div class="tunnel-panel-body">
-                <div class="tunnel-filter" id="tunnel-filter">
-                    <input type="text" class="tunnel-filter-input" id="tunnel-filter-input"
-                           placeholder="Filter tunnels... (Ctrl+K)"
-                           oninput="filterTunnels(this.value)">
-                </div>
-
-                <div id="tunnel-content">
-                    <!-- Tunnel groups rendered here -->
-                </div>
-            </div>
-
-            <div class="tunnel-footer">
-                <div class="tunnel-footer-left">
-                    <div class="tunnel-footer-status">
-                        <span id="tunnel-status-text">● Connected</span>
-                    </div>
-                </div>
-                <div class="tunnel-footer-right">
-                    <span class="tunnel-footer-config" id="config-path" title="Config file">~/.tunnel/tunnel.yaml</span>
-                    <button class="btn-reload" onclick="loadTunnels()" title="Reload tunnels">⟳</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Metrics Panel -->
-        <div class="metrics-panel" id="metrics-panel">
-            <div class="metrics-panel-header" onclick="toggleMetricsPanel()">
-                <span class="metrics-panel-title">📊 Metrics</span>
-                <span class="chevron" id="metrics-chevron">▼</span>
-            </div>
-            <div class="metrics-panel-body" id="metrics-body">
-                <div class="metrics-charts">
-                    <div class="metrics-chart-container">
-                        <div class="metrics-chart-label">Latency (ms)</div>
-                        <div class="metrics-chart" id="latency-chart">
-                            <svg id="latency-svg"></svg>
-                        </div>
-                    </div>
-                    <div class="metrics-chart-container">
-                        <div class="metrics-chart-label">Rate (req/s)</div>
-                        <div class="metrics-chart rate-chart" id="rate-chart">
-                            <svg id="rate-svg"></svg>
-                        </div>
-                    </div>
-                </div>
-                <div class="metrics-stats">
-                    <span class="metrics-stat"><span class="down">↓</span> <span id="bytes-in">0 B</span></span>
-                    <span class="metrics-stat"><span class="up">↑</span> <span id="bytes-out">0 B</span></span>
-                    <span class="metrics-stat"><span id="req-rate">0</span> req/min</span>
-                    <span class="metrics-stat"><span class="err" id="error-count">0</span> errors</span>
-                </div>
-                <div class="metrics-percentiles">
-                    <span>p50: <b id="p50-latency">--</b>ms</span>
-                    <span>p95: <b id="p95-latency">--</b>ms</span>
-                    <span>p99: <b id="p99-latency">--</b>ms</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Traffic Section -->
-        <div class="traffic-header">
-            <h1>Traffic</h1>
-            <div class="traffic-header-actions">
-                <button class="btn-theme" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme">
-                    <span id="theme-icon">🌙</span>
-                </button>
-                <button class="btn-export-har" onclick="exportHAR()" title="Export as HAR file">
-                    <span>📥</span>
-                </button>
-                <button class="btn-notify" id="btn-notify" onclick="toggleNotifications()" title="Enable desktop notifications for errors">
-                    <span class="notify-icon">🔔</span>
-                </button>
-                <button class="btn-pause" id="btn-pause" onclick="togglePause()" title="Pause/resume live updates (Space)">
-                    <span id="pause-icon">⏸</span><span id="pause-badge" class="pause-badge" style="display:none">0</span>
-                </button>
-                <div class="traffic-live-badge" id="traffic-badge">
-                    <div class="traffic-live-dot"></div>
-                    <span>Live</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Filter Bar -->
-        <div class="filter-bar">
-            <input type="text" class="filter-input" id="req-filter-input"
-                   placeholder="Filter by path..." oninput="filterRequests()">
-            <select class="filter-select" id="method-filter" onchange="filterRequests()">
-                <option value="">All Methods</option>
-                <option value="GET">GET</option>
-                <option value="POST">POST</option>
-                <option value="PUT">PUT</option>
-                <option value="DELETE">DELETE</option>
-                <option value="PATCH">PATCH</option>
-            </select>
-            <select class="filter-select" id="status-filter" onchange="filterRequests()">
-                <option value="">All Status</option>
-                <option value="2xx">2xx Success</option>
-                <option value="4xx">4xx Client Error</option>
-                <option value="5xx">5xx Server Error</option>
-            </select>
-        </div>
-
-        <!-- Compare Bar -->
-        <div id="compare-bar" class="compare-bar">
-            <span class="compare-bar-info"><span id="compare-count">0</span> requests selected for comparison</span>
-            <div class="compare-bar-actions">
-                <button class="btn-clear-compare" onclick="clearDiffSelection()">Clear</button>
-                <button class="btn-compare" id="btn-compare" onclick="showDiffModal()">Compare</button>
-            </div>
-        </div>
-
-        <div id="req-list" class="req-list"></div>
-    </div>
-
-    <!-- Add Tunnel Modal -->
-    <div class="modal-overlay" id="add-tunnel-modal">
-        <div class="modal">
-            <div class="modal-header">
-                <h2>New Tunnel</h2>
-                <button class="modal-close" onclick="hideAddTunnelModal()">✕</button>
-            </div>
-            <form onsubmit="submitAddTunnel(event)">
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label class="form-label">Type</label>
-                        <div class="form-type-selector">
-                            <label class="form-type-option selected" id="type-http">
-                                <input type="radio" name="tunnel-type" value="http" checked onchange="updateFormFields()">
-                                <div class="type-label">HTTP</div>
-                                <div class="type-desc">Web traffic</div>
-                            </label>
-                            <label class="form-type-option" id="type-tcp">
-                                <input type="radio" name="tunnel-type" value="tcp" onchange="updateFormFields()">
-                                <div class="type-label">TCP</div>
-                                <div class="type-desc">Raw TCP/SSH</div>
-                            </label>
-                        </div>
-                    </div>
-
-                    <div class="form-group" id="subdomain-group">
-                        <label class="form-label">Subdomain <span style="color: var(--text-muted)">(optional)</span></label>
-                        <input type="text" class="form-input" id="tunnel-subdomain" placeholder="my-app" oninput="updatePreview()">
-                        <div class="form-preview" id="subdomain-preview">→ random.px.csam.dev</div>
-                    </div>
-
-                    <div class="form-group" id="port-group" style="display: none;">
-                        <label class="form-label">Remote Port <span style="color: var(--text-muted)">(0 = random)</span></label>
-                        <input type="number" class="form-input" id="tunnel-port" placeholder="0" min="0" max="65535" value="0">
-                        <div class="form-hint">Server will assign an available port if 0</div>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Local Address</label>
-                        <input type="text" class="form-input" id="tunnel-local" placeholder="127.0.0.1:3000" required>
-                        <div class="form-hint">The local service to forward traffic to</div>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-checkbox">
-                            <input type="checkbox" id="tunnel-persist" checked>
-                            <span>Save to config file</span>
-                        </label>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn-modal-cancel" onclick="hideAddTunnelModal()">
-                        Cancel <span class="kbd">Esc</span>
-                    </button>
-                    <button type="submit" class="btn-modal-submit" id="btn-add-submit">
-                        Add Tunnel <span class="kbd">⏎</span>
-                    </button>
-                </div>
-            </form>
-        </div>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main">
-        <div id="empty-state" class="empty-state">
-            <div class="empty-state-icon">📡</div>
-            <div>Select a request to inspect details</div>
-        </div>
-
-        <div id="detail-view" class="detail-view">
-            <div class="detail-header">
-                <div class="detail-title">
-                    <span id="d-method" class="detail-method">GET</span>
-                    <span id="d-path" class="detail-path">/path</span>
-                </div>
-                <div class="detail-meta">
-                    <span id="d-status" class="detail-status">200</span>
-                    <span id="d-time">12:00:00</span>
-                    <span id="d-duration">120ms</span>
-                    <button id="btn-replay" class="btn-replay" onclick="replayRequest()">▶ Replay</button>
-                    <div class="export-dropdown">
-                        <button class="btn-export" onclick="toggleExportMenu()">⤓ Export</button>
-                        <div class="export-menu" id="export-menu">
-                            <div class="export-option" onclick="copyAsCurl()">Copy as cURL</div>
-                            <div class="export-option" onclick="copyAsFetch()">Copy as fetch</div>
-                        </div>
-                    </div>
-                </div>
-                <div id="replay-result" class="replay-result"></div>
-            </div>
-
-            <div class="detail-content">
-                <div class="detail-section">
-                    <div class="section-title">Request</div>
-                    <div class="tabs">
-                        <div class="tab active" onclick="switchTab('req', 'headers')">Headers</div>
-                        <div class="tab" onclick="switchTab('req', 'body')">Body</div>
-                    </div>
-                    <div id="req-headers" class="tab-content active">
-                        <div id="req-headers-list" class="kv-grid"></div>
-                    </div>
-                    <div id="req-body" class="tab-content">
-                        <pre id="req-body-content"></pre>
-                    </div>
-                </div>
-
-                <div class="detail-section">
-                    <div class="section-title">Response</div>
-                    <div class="tabs">
-                        <div class="tab active" onclick="switchTab('res', 'headers')">Headers</div>
-                        <div class="tab" onclick="switchTab('res', 'body')">Body</div>
-                    </div>
-                    <div id="res-headers" class="tab-content active">
-                        <div id="res-headers-list" class="kv-grid"></div>
-                    </div>
-                    <div id="res-body" class="tab-content">
-                        <pre id="res-body-content"></pre>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Diff Modal -->
-    <div id="diff-modal" class="diff-modal" onclick="closeDiffModal(event)">
-        <div class="diff-modal-content" onclick="event.stopPropagation()">
-            <div class="diff-modal-header">
-                <span class="diff-modal-title">Request Comparison</span>
-                <button class="diff-modal-close" onclick="closeDiffModal()">&times;</button>
-            </div>
-            <div class="diff-tabs">
-                <div class="diff-tab active" data-diff-tab="url" onclick="switchDiffTab('url')">URL & Method</div>
-                <div class="diff-tab" data-diff-tab="headers" onclick="switchDiffTab('headers')">Headers</div>
-                <div class="diff-tab" data-diff-tab="body" onclick="switchDiffTab('body')">Body</div>
-            </div>
-            <div class="diff-body">
-                <div class="diff-pane">
-                    <div class="diff-pane-header" id="diff-left-header">Request 1</div>
-                    <div id="diff-left-content"></div>
-                </div>
-                <div class="diff-pane">
-                    <div class="diff-pane-header" id="diff-right-header">Request 2</div>
-                    <div id="diff-right-content"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- QR Code Modal -->
-    <div id="qr-modal" class="qr-modal" onclick="closeQRModal(event)">
-        <div class="qr-modal-content" onclick="event.stopPropagation()">
-            <div class="qr-modal-title">Scan to Open</div>
-            <div class="qr-container">
-                <canvas id="qr-canvas" width="200" height="200"></canvas>
-            </div>
-            <div class="qr-url" id="qr-url"></div>
-            <button class="qr-modal-close" onclick="closeQRModal()">Close</button>
-        </div>
-    </div>
-
-    <!-- Webhook Tester Modal -->
-    <div id="webhook-modal" class="webhook-modal" onclick="closeWebhookModal(event)">
-        <div class="webhook-modal-content" onclick="event.stopPropagation()">
-            <div class="webhook-modal-header">
-                <span class="webhook-modal-title">Webhook Tester</span>
-                <button class="webhook-modal-close" onclick="closeWebhookModal()">&times;</button>
-            </div>
-            <div class="webhook-form">
-                <div class="webhook-row">
-                    <select id="webhook-method" class="webhook-method">
-                        <option value="GET">GET</option>
-                        <option value="POST" selected>POST</option>
-                        <option value="PUT">PUT</option>
-                        <option value="PATCH">PATCH</option>
-                        <option value="DELETE">DELETE</option>
-                    </select>
-                    <input type="text" id="webhook-url" class="webhook-url" placeholder="https://your-tunnel.example.com/webhook">
-                </div>
-                <div class="webhook-label">Headers (JSON)</div>
-                <textarea id="webhook-headers" class="webhook-headers" placeholder='{"Content-Type": "application/json"}'></textarea>
-                <div class="webhook-label">Body</div>
-                <textarea id="webhook-body" class="webhook-body" placeholder='{"event": "test", "data": {}}'></textarea>
-                <div class="webhook-actions">
-                    <button id="btn-webhook-send" class="btn-webhook-send" onclick="sendWebhookTest()">Send Request</button>
-                </div>
-                <div id="webhook-response" class="webhook-response">
-                    <div class="webhook-response-header">
-                        <span id="webhook-response-status" class="webhook-response-status"></span>
-                        <span id="webhook-response-time" class="webhook-response-time"></span>
-                    </div>
-                    <pre id="webhook-response-body" class="webhook-response-body"></pre>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Keyboard Shortcuts Modal -->
-    <div id="shortcuts-modal" class="shortcuts-modal" onclick="closeShortcutsModal(event)">
-        <div class="shortcuts-modal-content" onclick="event.stopPropagation()">
-            <div class="shortcuts-modal-header">
-                <span class="shortcuts-modal-title">Keyboard Shortcuts</span>
-                <button class="shortcuts-modal-close" onclick="closeShortcutsModal()">&times;</button>
-            </div>
-            <div class="shortcuts-grid">
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Show shortcuts</span>
-                    <span class="shortcut-key">?</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">New tunnel</span>
-                    <span class="shortcut-key">N</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Focus filter</span>
-                    <span class="shortcut-key">Ctrl+K</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Close modal</span>
-                    <span class="shortcut-key">Esc</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Next request</span>
-                    <span class="shortcut-key">J</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Previous request</span>
-                    <span class="shortcut-key">K</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Replay request</span>
-                    <span class="shortcut-key">R</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Copy as cURL</span>
-                    <span class="shortcut-key">C</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Pause/resume</span>
-                    <span class="shortcut-key">Space</span>
-                </div>
-                <div class="shortcut-item">
-                    <span class="shortcut-desc">Toggle theme</span>
-                    <span class="shortcut-key">T</span>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        // State
-        let tunnelsList = [];
-        let filteredTunnels = [];
-        let filterQuery = '';
-        let collapsedGroups = {};
-        let requestsMap = {};
-        let requestsList = [];
-        let filteredRequestsList = [];
-        let selectedId = null;
-        let sseConnected = false;
-        let metricsCollapsed = false;
-        let metricsData = null;
-        let selectedForDiff = [];
-        let currentDiffTab = 'url';
-        let reconnectCount = 0;
-        let lastHeartbeat = null;
-        let connectionStartTime = null;
-        let notificationsEnabled = false;
-        let isPaused = false;
-        let pausedQueue = [];
-        let theme = localStorage.getItem('tunnel_theme') || 'dark';
-
-        // ===== METRICS =====
-
-        function fetchMetrics() {
-            fetch('/api/metrics')
-                .then(r => r.json())
-                .then(data => {
-                    metricsData = data;
-                    updateMetricsUI();
-                })
-                .catch(err => console.error('Failed to fetch metrics:', err));
-        }
-
-        function updateMetricsUI() {
-            if (!metricsData) return;
-
-            document.getElementById('bytes-in').textContent = formatBytes(metricsData.total_bytes_in);
-            document.getElementById('bytes-out').textContent = formatBytes(metricsData.total_bytes_out);
-            document.getElementById('req-rate').textContent = Math.round(metricsData.requests_per_min);
-            document.getElementById('error-count').textContent = metricsData.error_count;
-
-            // Update percentiles
-            document.getElementById('p50-latency').textContent = metricsData.p50_latency_ms || '--';
-            document.getElementById('p95-latency').textContent = metricsData.p95_latency_ms || '--';
-            document.getElementById('p99-latency').textContent = metricsData.p99_latency_ms || '--';
-
-            renderLatencyChart(metricsData.latency_history || []);
-            renderRateChart(metricsData.rate_history || []);
-        }
-
-        function renderRateChart(rates) {
-            const svg = document.getElementById('rate-svg');
-            if (!svg) return;
-
-            const w = svg.clientWidth || 180;
-            const h = svg.clientHeight || 40;
-            const padding = 2;
-
-            // Use last 30 seconds for the bar chart
-            const data = rates.slice(-30);
-            if (data.length === 0 || data.every(r => r === 0)) {
-                svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#6e7681" font-size="9">No traffic</text>';
-                return;
-            }
-
-            const maxRate = Math.max(...data, 1);
-            const barWidth = (w - padding * 2) / data.length - 1;
-
-            let bars = '';
-            data.forEach((rate, i) => {
-                const x = padding + i * (barWidth + 1);
-                const barHeight = (rate / maxRate) * (h - padding * 2);
-                const y = h - padding - barHeight;
-                bars += '<rect class="rate-bar" x="' + x + '" y="' + y + '" width="' + barWidth + '" height="' + barHeight + '" rx="1"/>';
-            });
-
-            const currentRate = data[data.length - 1] || 0;
-            svg.innerHTML = bars + '<text x="' + (w - padding) + '" y="10" text-anchor="end" fill="var(--text-muted)" font-size="9">' + currentRate + '/s</text>';
-        }
-
-        function renderLatencyChart(points) {
-            const svg = document.getElementById('latency-svg');
-            if (!svg || points.length < 2) {
-                if (svg) svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#6e7681" font-size="10">Awaiting data...</text>';
-                return;
-            }
-
-            const w = svg.clientWidth || 380;
-            const h = svg.clientHeight || 50;
-            const padding = 4;
-
-            const maxLatency = Math.max(...points.map(p => p.ms), 1);
-            const xScale = (w - padding * 2) / (points.length - 1);
-            const yScale = (h - padding * 2) / maxLatency;
-
-            const pathData = points.map((p, i) => {
-                const x = padding + i * xScale;
-                const y = h - padding - p.ms * yScale;
-                return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
-            }).join(' ');
-
-            const avgLatency = points.reduce((sum, p) => sum + p.ms, 0) / points.length;
-
-            svg.innerHTML =
-                '<path d="' + pathData + '" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
-                '<text x="' + (w - padding) + '" y="12" text-anchor="end" fill="var(--text-muted)" font-size="9">avg ' + Math.round(avgLatency) + 'ms</text>';
-        }
-
-        function toggleMetricsPanel() {
-            metricsCollapsed = !metricsCollapsed;
-            const body = document.getElementById('metrics-body');
-            const chevron = document.getElementById('metrics-chevron');
-            if (metricsCollapsed) {
-                body.style.display = 'none';
-                chevron.style.transform = 'rotate(-90deg)';
-            } else {
-                body.style.display = 'block';
-                chevron.style.transform = 'rotate(0deg)';
-            }
-        }
-
-        function formatBytes(bytes) {
-            if (bytes === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-        }
-
-        // Start metrics polling
-        setInterval(fetchMetrics, 2000);
-
-        // ===== REQUEST FILTERING =====
-
-        function filterRequests() {
-            const pathFilter = document.getElementById('req-filter-input').value.toLowerCase();
-            const methodFilter = document.getElementById('method-filter').value;
-            const statusFilter = document.getElementById('status-filter').value;
-
-            filteredRequestsList = requestsList.filter(req => {
-                // Path filter
-                if (pathFilter && !req.path.toLowerCase().includes(pathFilter)) {
-                    return false;
-                }
-                // Method filter
-                if (methodFilter && req.method !== methodFilter) {
-                    return false;
-                }
-                // Status filter
-                if (statusFilter) {
-                    const status = req.status;
-                    if (statusFilter === '2xx' && (status < 200 || status >= 300)) return false;
-                    if (statusFilter === '4xx' && (status < 400 || status >= 500)) return false;
-                    if (statusFilter === '5xx' && (status < 500 || status >= 600)) return false;
-                }
-                return true;
-            });
-
-            renderFilteredRequests();
-        }
-
-        function renderFilteredRequests() {
-            const container = document.getElementById('req-list');
-            container.innerHTML = '';
-            filteredRequestsList.forEach(req => {
-                container.appendChild(createRequestItem(req));
-            });
-        }
-
-        // ===== SYNTAX HIGHLIGHTING =====
-
-        function highlightJSON(str) {
-            try {
-                const obj = JSON.parse(str);
-                str = JSON.stringify(obj, null, 2);
-            } catch (e) {
-                // Not valid JSON, return as-is
-                return escapeHtml(str);
-            }
-            return escapeHtml(str)
-                .replace(/"([^"]+)":/g, '<span class="json-key">"$1"</span>:')
-                .replace(/: "([^"]*)"/g, ': <span class="json-string">"$1"</span>')
-                .replace(/: (-?\d+\.?\d*)/g, ': <span class="json-number">$1</span>')
-                .replace(/: (true|false)/g, ': <span class="json-bool">$1</span>')
-                .replace(/: (null)/g, ': <span class="json-null">$1</span>');
-        }
-
-        function escapeHtml(str) {
-            return str
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
-        }
-
-        function formatBody(body, contentType) {
-            if (!body) return '<span style="color: var(--text-muted)">No content</span>';
-            contentType = contentType || '';
-            if (contentType.includes('json') || body.trim().startsWith('{') || body.trim().startsWith('[')) {
-                return highlightJSON(body);
-            }
-            return escapeHtml(body);
-        }
-
-        // ===== EXPORT FUNCTIONS =====
-
-        function toggleExportMenu() {
-            const menu = document.getElementById('export-menu');
-            menu.classList.toggle('visible');
-
-            // Close menu when clicking outside
-            if (menu.classList.contains('visible')) {
-                setTimeout(() => {
-                    document.addEventListener('click', closeExportMenu);
-                }, 0);
-            }
-        }
-
-        function closeExportMenu(e) {
-            const menu = document.getElementById('export-menu');
-            const dropdown = e.target.closest('.export-dropdown');
-            if (!dropdown) {
-                menu.classList.remove('visible');
-                document.removeEventListener('click', closeExportMenu);
-            }
-        }
-
-        function generateCurl(r) {
-            let cmd = 'curl';
-
-            // Method
-            if (r.method !== 'GET') {
-                cmd += ' -X ' + r.method;
-            }
-
-            // Headers
-            if (r.req_header) {
-                for (const [key, values] of Object.entries(r.req_header)) {
-                    if (key.toLowerCase() === 'host') continue;
-                    const val = Array.isArray(values) ? values[0] : values;
-                    cmd += " \\\n  -H '" + key + ': ' + val.replace(/'/g, "'\\''") + "'";
-                }
-            }
-
-            // Body
-            if (r.req_body) {
-                cmd += " \\\n  -d '" + r.req_body.replace(/'/g, "'\\''") + "'";
-            }
-
-            // URL
-            cmd += " \\\n  '" + r.url + "'";
-
-            return cmd;
-        }
-
-        function generateFetch(r) {
-            const options = {
-                method: r.method
-            };
-
-            // Headers
-            if (r.req_header) {
-                options.headers = {};
-                for (const [key, values] of Object.entries(r.req_header)) {
-                    if (key.toLowerCase() === 'host') continue;
-                    options.headers[key] = Array.isArray(values) ? values[0] : values;
-                }
-            }
-
-            // Body
-            if (r.req_body) {
-                options.body = r.req_body;
-            }
-
-            return "fetch('" + r.url + "', " + JSON.stringify(options, null, 2) + ")\n  .then(res => res.json())\n  .then(console.log)\n  .catch(console.error);";
-        }
-
-        function copyAsCurl() {
-            if (!selectedId) return;
-            const r = requestsMap[selectedId];
-            if (!r) return;
-
-            const curl = generateCurl(r);
-            copyToClipboard(curl);
-            document.getElementById('export-menu').classList.remove('visible');
-        }
-
-        function copyAsFetch() {
-            if (!selectedId) return;
-            const r = requestsMap[selectedId];
-            if (!r) return;
-
-            const fetchCode = generateFetch(r);
-            copyToClipboard(fetchCode);
-            document.getElementById('export-menu').classList.remove('visible');
-        }
-
-        function copyToClipboard(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                showCopyToast('Copied to clipboard!');
-            }).catch(err => {
-                console.error('Failed to copy:', err);
-            });
-        }
-
-        function showCopyToast(message) {
-            let toast = document.getElementById('copy-toast');
-            if (!toast) {
-                toast = document.createElement('div');
-                toast.id = 'copy-toast';
-                toast.className = 'copy-toast';
-                document.body.appendChild(toast);
-            }
-            toast.textContent = message;
-            toast.classList.add('visible');
-            setTimeout(() => {
-                toast.classList.remove('visible');
-            }, 2000);
-        }
-
-        // ===== DIFF COMPARISON =====
-
-        function toggleDiffSelection(id, checked) {
-            if (checked) {
-                if (selectedForDiff.length < 2) {
-                    selectedForDiff.push(id);
-                } else {
-                    // Already have 2, replace the oldest
-                    selectedForDiff.shift();
-                    selectedForDiff.push(id);
-                    // Update checkboxes in UI
-                    renderRequests();
-                }
-            } else {
-                selectedForDiff = selectedForDiff.filter(x => x !== id);
-            }
-            updateCompareBar();
-        }
-
-        function updateCompareBar() {
-            const bar = document.getElementById('compare-bar');
-            const countEl = document.getElementById('compare-count');
-            const btnCompare = document.getElementById('btn-compare');
-
-            countEl.textContent = selectedForDiff.length;
-
-            if (selectedForDiff.length > 0) {
-                bar.classList.add('visible');
-            } else {
-                bar.classList.remove('visible');
-            }
-
-            btnCompare.disabled = selectedForDiff.length !== 2;
-            btnCompare.style.opacity = selectedForDiff.length === 2 ? '1' : '0.5';
-        }
-
-        function clearDiffSelection() {
-            selectedForDiff = [];
-            updateCompareBar();
-            renderRequests();
-        }
-
-        function showDiffModal() {
-            if (selectedForDiff.length !== 2) return;
-
-            const modal = document.getElementById('diff-modal');
-            modal.classList.add('visible');
-            currentDiffTab = 'url';
-            updateDiffTabs();
-            renderDiffContent();
-        }
-
-        function closeDiffModal(event) {
-            if (event && event.target !== event.currentTarget) return;
-            document.getElementById('diff-modal').classList.remove('visible');
-        }
-
-        function switchDiffTab(tab) {
-            currentDiffTab = tab;
-            updateDiffTabs();
-            renderDiffContent();
-        }
-
-        function updateDiffTabs() {
-            document.querySelectorAll('.diff-tab').forEach(el => {
-                el.classList.toggle('active', el.dataset.diffTab === currentDiffTab);
-            });
-        }
-
-        function renderDiffContent() {
-            const req1 = requestsMap[selectedForDiff[0]];
-            const req2 = requestsMap[selectedForDiff[1]];
-
-            if (!req1 || !req2) return;
-
-            const leftHeader = document.getElementById('diff-left-header');
-            const rightHeader = document.getElementById('diff-right-header');
-            const leftContent = document.getElementById('diff-left-content');
-            const rightContent = document.getElementById('diff-right-content');
-
-            leftHeader.textContent = req1.method + ' ' + req1.path + ' (' + new Date(req1.timestamp).toLocaleTimeString() + ')';
-            rightHeader.textContent = req2.method + ' ' + req2.path + ' (' + new Date(req2.timestamp).toLocaleTimeString() + ')';
-
-            let left = '', right = '';
-
-            switch (currentDiffTab) {
-                case 'url':
-                    left = formatForDiff('Method: ' + req1.method + '\nURL: ' + req1.url + '\nPath: ' + req1.path + '\nStatus: ' + req1.status + '\nDuration: ' + req1.duration);
-                    right = formatForDiff('Method: ' + req2.method + '\nURL: ' + req2.url + '\nPath: ' + req2.path + '\nStatus: ' + req2.status + '\nDuration: ' + req2.duration);
-                    break;
-                case 'headers':
-                    left = formatForDiff(formatHeaders(req1.req_header || {}));
-                    right = formatForDiff(formatHeaders(req2.req_header || {}));
-                    break;
-                case 'body':
-                    left = formatForDiff(formatBody(req1.req_body));
-                    right = formatForDiff(formatBody(req2.req_body));
-                    break;
-            }
-
-            const { leftHtml, rightHtml } = computeDiff(left, right);
-            leftContent.innerHTML = leftHtml;
-            rightContent.innerHTML = rightHtml;
-        }
-
-        function formatHeaders(headers) {
-            if (!headers || Object.keys(headers).length === 0) return '(no headers)';
-            return Object.entries(headers)
-                .map(([k, v]) => k + ': ' + (Array.isArray(v) ? v.join(', ') : v))
-                .sort()
-                .join('\n');
-        }
-
-        function formatBody(body) {
-            if (!body) return '(no body)';
-            try {
-                return JSON.stringify(JSON.parse(body), null, 2);
-            } catch {
-                return body;
-            }
-        }
-
-        function formatForDiff(text) {
-            return text.split('\n');
-        }
-
-        function computeDiff(leftLines, rightLines) {
-            const maxLen = Math.max(leftLines.length, rightLines.length);
-            let leftHtml = '';
-            let rightHtml = '';
-
-            for (let i = 0; i < maxLen; i++) {
-                const l = leftLines[i] || '';
-                const r = rightLines[i] || '';
-
-                if (l === r) {
-                    leftHtml += '<div class="diff-line unchanged">' + escapeHtml(l) + '</div>';
-                    rightHtml += '<div class="diff-line unchanged">' + escapeHtml(r) + '</div>';
-                } else if (!l && r) {
-                    leftHtml += '<div class="diff-line removed">&nbsp;</div>';
-                    rightHtml += '<div class="diff-line added">' + escapeHtml(r) + '</div>';
-                } else if (l && !r) {
-                    leftHtml += '<div class="diff-line removed">' + escapeHtml(l) + '</div>';
-                    rightHtml += '<div class="diff-line added">&nbsp;</div>';
-                } else {
-                    leftHtml += '<div class="diff-line removed">' + escapeHtml(l) + '</div>';
-                    rightHtml += '<div class="diff-line added">' + escapeHtml(r) + '</div>';
-                }
-            }
-
-            return { leftHtml, rightHtml };
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        // ===== QR CODE =====
-
-        function showQRCode(url) {
-            document.getElementById('qr-url').textContent = url;
-            document.getElementById('qr-modal').classList.add('visible');
-            generateQRCode(url);
-        }
-
-        function closeQRModal(event) {
-            if (event && event.target !== event.currentTarget) return;
-            document.getElementById('qr-modal').classList.remove('visible');
-        }
-
-        // Render QR code using Google Charts API (simple fallback)
-        function generateQRCode(text) {
-            const canvas = document.getElementById('qr-canvas');
-            const ctx = canvas.getContext('2d');
-            const size = 200;
-
-            // Use an image from Google Charts QR API
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = function() {
-                ctx.fillStyle = 'white';
-                ctx.fillRect(0, 0, size, size);
-                ctx.drawImage(img, 0, 0, size, size);
-            };
-            img.onerror = function() {
-                // Fallback: draw placeholder with URL text
-                ctx.fillStyle = 'white';
-                ctx.fillRect(0, 0, size, size);
-                ctx.fillStyle = '#333';
-                ctx.font = '12px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillText('QR Code', size/2, size/2 - 10);
-                ctx.fillText('(scan URL below)', size/2, size/2 + 10);
-            };
-            img.src = 'https://chart.googleapis.com/chart?cht=qr&chs=' + size + 'x' + size + '&chl=' + encodeURIComponent(text) + '&choe=UTF-8';
-        }
-
-        // ===== WEBHOOK TESTER =====
-
-        function showWebhookTester(url) {
-            document.getElementById('webhook-url').value = url || '';
-            document.getElementById('webhook-headers').value = '{"Content-Type": "application/json"}';
-            document.getElementById('webhook-body').value = '';
-            document.getElementById('webhook-response').classList.remove('visible');
-            document.getElementById('webhook-modal').classList.add('visible');
-        }
-
-        function closeWebhookModal(event) {
-            if (event && event.target !== event.currentTarget) return;
-            document.getElementById('webhook-modal').classList.remove('visible');
-        }
-
-        function sendWebhookTest() {
-            const method = document.getElementById('webhook-method').value;
-            const url = document.getElementById('webhook-url').value;
-            const headersStr = document.getElementById('webhook-headers').value;
-            const body = document.getElementById('webhook-body').value;
-            const btn = document.getElementById('btn-webhook-send');
-            const responseDiv = document.getElementById('webhook-response');
-
-            if (!url) {
-                alert('URL is required');
-                return;
-            }
-
-            let headers = {};
-            if (headersStr.trim()) {
-                try {
-                    headers = JSON.parse(headersStr);
-                } catch (e) {
-                    alert('Invalid JSON in headers');
-                    return;
-                }
-            }
-
-            btn.disabled = true;
-            btn.textContent = 'Sending...';
-
-            fetch('/api/webhook-test', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ url, method, headers, body })
-            })
-            .then(r => r.json())
-            .then(data => {
-                btn.disabled = false;
-                btn.textContent = 'Send Request';
-                responseDiv.classList.add('visible');
-
-                const statusEl = document.getElementById('webhook-response-status');
-                const timeEl = document.getElementById('webhook-response-time');
-                const bodyEl = document.getElementById('webhook-response-body');
-
-                if (data.error) {
-                    statusEl.textContent = 'Error: ' + data.error;
-                    statusEl.className = 'webhook-response-status error';
-                    bodyEl.textContent = '';
-                } else {
-                    statusEl.textContent = data.status_text;
-                    statusEl.className = 'webhook-response-status ' + (data.status < 400 ? 'success' : 'error');
-                    bodyEl.textContent = formatResponseBody(data.body, data.content_type);
-                }
-                timeEl.textContent = data.duration_ms + 'ms';
-            })
-            .catch(err => {
-                btn.disabled = false;
-                btn.textContent = 'Send Request';
-                alert('Error: ' + err.message);
-            });
-        }
-
-        function formatResponseBody(body, contentType) {
-            if (!body) return '(empty response)';
-            if (contentType && contentType.includes('application/json')) {
-                try {
-                    return JSON.stringify(JSON.parse(body), null, 2);
-                } catch {
-                    return body;
-                }
-            }
-            return body;
-        }
-
-        // ===== TUNNEL MANAGEMENT =====
-
-        function loadTunnels() {
-            fetch('/api/tunnels')
-                .then(r => r.json())
-                .then(data => {
-                    tunnelsList = data || [];
-                    filterTunnels(filterQuery);
-                    updateTunnelCount();
-                })
-                .catch(err => {
-                    console.error('Failed to load tunnels:', err);
-                    renderTunnelError();
-                });
-        }
-
-        function updateTunnelCount() {
-            document.getElementById('tunnel-count').textContent = tunnelsList.length;
-            // Show filter if more than 5 tunnels
-            const filterEl = document.getElementById('tunnel-filter');
-            if (tunnelsList.length > 5) {
-                filterEl.classList.add('visible');
-            } else {
-                filterEl.classList.remove('visible');
-            }
-        }
-
-        function filterTunnels(query) {
-            filterQuery = query.toLowerCase();
-            if (!filterQuery) {
-                filteredTunnels = tunnelsList;
-            } else {
-                filteredTunnels = tunnelsList.filter(t => {
-                    const searchStr = (t.public_url || '') + (t.subdomain || '') + t.local_addr + t.type;
-                    return searchStr.toLowerCase().includes(filterQuery);
-                });
-            }
-            renderTunnels();
-        }
-
-        function renderTunnels() {
-            const container = document.getElementById('tunnel-content');
-            container.replaceChildren();
-
-            if (tunnelsList.length === 0) {
-                renderEmptyState(container);
-                return;
-            }
-
-            if (filteredTunnels.length === 0) {
-                const noMatch = document.createElement('div');
-                noMatch.className = 'tunnel-empty';
-                noMatch.textContent = 'No tunnels match your filter';
-                container.appendChild(noMatch);
-                return;
-            }
-
-            // Group by type
-            const httpTunnels = filteredTunnels.filter(t => t.type === 'http');
-            const tcpTunnels = filteredTunnels.filter(t => t.type === 'tcp');
-
-            if (httpTunnels.length > 0) {
-                container.appendChild(createTunnelGroup('http', httpTunnels));
-            }
-            if (tcpTunnels.length > 0) {
-                container.appendChild(createTunnelGroup('tcp', tcpTunnels));
-            }
-        }
-
-        function createTunnelGroup(type, tunnels) {
-            const group = document.createElement('div');
-            group.className = 'tunnel-group' + (collapsedGroups[type] ? ' collapsed' : '');
-            group.dataset.type = type;
-
-            const header = document.createElement('div');
-            header.className = 'tunnel-group-header';
-            header.onclick = () => toggleGroup(type);
-
-            const chevron = document.createElement('span');
-            chevron.className = 'chevron';
-            chevron.textContent = '▼';
-            header.appendChild(chevron);
-
-            const label = document.createElement('span');
-            label.textContent = type.toUpperCase();
-            header.appendChild(label);
-
-            const line = document.createElement('span');
-            line.className = 'line';
-            header.appendChild(line);
-
-            const count = document.createElement('span');
-            count.className = 'count';
-            count.textContent = '(' + tunnels.length + ')';
-            header.appendChild(count);
-
-            group.appendChild(header);
-
-            const body = document.createElement('div');
-            body.className = 'tunnel-group-body';
-
-            const tree = document.createElement('div');
-            tree.className = 'tunnel-tree';
-
-            tunnels.forEach((tunnel, index) => {
-                const isLast = index === tunnels.length - 1;
-                tree.appendChild(createTunnelItem(tunnel, isLast, type));
-            });
-
-            body.appendChild(tree);
-            group.appendChild(body);
-
-            return group;
-        }
-
-        function createTunnelItem(tunnel, isLast, type) {
-            const item = document.createElement('div');
-            item.className = 'tunnel-item';
-
-            // Tree connector
-            const connector = document.createElement('div');
-            connector.className = 'tree-connector';
-            const line = document.createElement('span');
-            line.className = 'line';
-            line.textContent = isLast ? '└─' : '├─';
-            connector.appendChild(line);
-            item.appendChild(connector);
-
-            // Content
-            const content = document.createElement('div');
-            content.className = 'tunnel-content';
-
-            // Main row
-            const mainRow = document.createElement('div');
-            mainRow.className = 'tunnel-main-row';
-
-            const status = document.createElement('div');
-            status.className = 'tunnel-status';
-            status.title = 'Active';
-            mainRow.appendChild(status);
-
-            const url = document.createElement('span');
-            url.className = 'tunnel-url';
-            if (type === 'http') {
-                url.textContent = tunnel.public_url || tunnel.subdomain + '.px.csam.dev';
-            } else {
-                url.textContent = tunnel.public_url || 'tcp://px.csam.dev:' + tunnel.remote_port;
-            }
-            url.title = url.textContent;
-            mainRow.appendChild(url);
-
-            // Actions
-            const actions = document.createElement('div');
-            actions.className = 'tunnel-actions';
-
-            const copyBtn = document.createElement('button');
-            copyBtn.className = 'tunnel-action-btn';
-            copyBtn.textContent = '⎘';
-            copyBtn.title = 'Copy URL';
-            copyBtn.onclick = (e) => { e.stopPropagation(); copyTunnelUrl(tunnel, copyBtn); };
-            actions.appendChild(copyBtn);
-
-            const cmdBtn = document.createElement('button');
-            cmdBtn.className = 'tunnel-action-btn';
-            cmdBtn.textContent = type === 'http' ? '⧉' : '⌘';
-            cmdBtn.title = type === 'http' ? 'Copy curl command' : 'Copy SSH command';
-            cmdBtn.onclick = (e) => { e.stopPropagation(); copyTunnelCommand(tunnel, cmdBtn); };
-            actions.appendChild(cmdBtn);
-
-            const qrBtn = document.createElement('button');
-            qrBtn.className = 'tunnel-action-btn';
-            qrBtn.textContent = '⊞';
-            qrBtn.title = 'Show QR code';
-            qrBtn.onclick = (e) => { e.stopPropagation(); showQRCode(tunnel.public_url); };
-            actions.appendChild(qrBtn);
-
-            if (type === 'http') {
-                const testBtn = document.createElement('button');
-                testBtn.className = 'tunnel-action-btn';
-                testBtn.textContent = '⚡';
-                testBtn.title = 'Test webhook';
-                testBtn.onclick = (e) => { e.stopPropagation(); showWebhookTester(tunnel.public_url); };
-                actions.appendChild(testBtn);
-            }
-
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'tunnel-action-btn remove';
-            removeBtn.textContent = '✕';
-            removeBtn.title = 'Remove tunnel';
-            removeBtn.onclick = (e) => { e.stopPropagation(); removeTunnel(tunnel); };
-            actions.appendChild(removeBtn);
-
-            mainRow.appendChild(actions);
-            content.appendChild(mainRow);
-
-            // Local row
-            const localRow = document.createElement('div');
-            localRow.className = 'tunnel-local-row';
-
-            const elbow = document.createElement('span');
-            elbow.className = 'tree-elbow';
-            elbow.textContent = '└─';
-            localRow.appendChild(elbow);
-
-            const arrow = document.createElement('span');
-            arrow.className = 'tunnel-arrow';
-            arrow.textContent = '→';
-            localRow.appendChild(arrow);
-
-            const local = document.createElement('span');
-            local.className = 'tunnel-local';
-            local.textContent = tunnel.local_addr;
-            localRow.appendChild(local);
-
-            content.appendChild(localRow);
-            item.appendChild(content);
-
-            return item;
-        }
-
-        function renderEmptyState(container) {
-            const empty = document.createElement('div');
-            empty.className = 'tunnel-empty';
-
-            const icon = document.createElement('div');
-            icon.className = 'tunnel-empty-icon';
-            icon.textContent = '🚇';
-            empty.appendChild(icon);
-
-            const title = document.createElement('div');
-            title.className = 'tunnel-empty-title';
-            title.textContent = 'No tunnels configured';
-            empty.appendChild(title);
-
-            const hint = document.createElement('div');
-            hint.className = 'tunnel-empty-hint';
-            hint.textContent = 'Press N or click below to add one';
-            empty.appendChild(hint);
-
-            const btn = document.createElement('button');
-            btn.className = 'btn-empty-add';
-            btn.textContent = '+ Add Tunnel';
-            btn.onclick = showAddTunnelModal;
-            empty.appendChild(btn);
-
-            container.appendChild(empty);
-        }
-
-        function renderTunnelError() {
-            const container = document.getElementById('tunnel-content');
-            container.replaceChildren();
-            const err = document.createElement('div');
-            err.className = 'tunnel-empty';
-            err.textContent = 'Failed to load tunnels';
-            container.appendChild(err);
-        }
-
-        function toggleTunnelPanel() {
-            document.getElementById('tunnel-panel').classList.toggle('collapsed');
-        }
-
-        function toggleGroup(type) {
-            collapsedGroups[type] = !collapsedGroups[type];
-            const group = document.querySelector('.tunnel-group[data-type="' + type + '"]');
-            if (group) {
-                group.classList.toggle('collapsed');
-            }
-        }
-
-        function copyTunnelUrl(tunnel, btn) {
-            const url = tunnel.public_url || (tunnel.type === 'http' ?
-                'https://' + tunnel.subdomain + '.px.csam.dev' :
-                'px.csam.dev:' + tunnel.remote_port);
-
-            navigator.clipboard.writeText(url).then(() => {
-                btn.classList.add('copy-success');
-                btn.textContent = '✓';
-                setTimeout(() => {
-                    btn.classList.remove('copy-success');
-                    btn.textContent = '⎘';
-                }, 1500);
-            });
-        }
-
-        function copyTunnelCommand(tunnel, btn) {
-            let cmd;
-            if (tunnel.type === 'http') {
-                const url = tunnel.public_url || 'https://' + tunnel.subdomain + '.px.csam.dev';
-                cmd = 'curl ' + url;
-            } else {
-                const parts = (tunnel.public_url || 'px.csam.dev:' + tunnel.remote_port).replace('tcp://', '').split(':');
-                cmd = 'ssh -p ' + parts[1] + ' user@' + parts[0];
-            }
-
-            navigator.clipboard.writeText(cmd).then(() => {
-                btn.classList.add('copy-success');
-                btn.textContent = '✓';
-                setTimeout(() => {
-                    btn.classList.remove('copy-success');
-                    btn.textContent = tunnel.type === 'http' ? '⧉' : '⌘';
-                }, 1500);
-            });
-        }
-
-        function showAddTunnelModal() {
-            document.getElementById('add-tunnel-modal').classList.add('visible');
-            document.getElementById('tunnel-subdomain').value = '';
-            document.getElementById('tunnel-port').value = '0';
-            document.getElementById('tunnel-local').value = '';
-            document.getElementById('tunnel-persist').checked = true;
-            document.querySelector('input[name="tunnel-type"][value="http"]').checked = true;
-            updateFormFields();
-            updatePreview();
-            document.getElementById('tunnel-local').focus();
-        }
-
-        function hideAddTunnelModal() {
-            document.getElementById('add-tunnel-modal').classList.remove('visible');
-        }
-
-        function updateFormFields() {
-            const type = document.querySelector('input[name="tunnel-type"]:checked').value;
-            document.getElementById('type-http').classList.toggle('selected', type === 'http');
-            document.getElementById('type-tcp').classList.toggle('selected', type === 'tcp');
-            document.getElementById('subdomain-group').style.display = type === 'http' ? 'block' : 'none';
-            document.getElementById('port-group').style.display = type === 'tcp' ? 'block' : 'none';
-        }
-
-        function updatePreview() {
-            const subdomain = document.getElementById('tunnel-subdomain').value.trim();
-            const preview = document.getElementById('subdomain-preview');
-            if (subdomain) {
-                preview.textContent = '→ ' + subdomain + '.px.csam.dev';
-            } else {
-                preview.textContent = '→ random.px.csam.dev';
-            }
-        }
-
-        function submitAddTunnel(event) {
-            event.preventDefault();
-
-            const type = document.querySelector('input[name="tunnel-type"]:checked').value;
-            const subdomain = document.getElementById('tunnel-subdomain').value.trim();
-            const remotePort = parseInt(document.getElementById('tunnel-port').value) || 0;
-            const localAddr = document.getElementById('tunnel-local').value.trim();
-            const persist = document.getElementById('tunnel-persist').checked;
-
-            if (!localAddr) {
-                alert('Local address is required');
-                return;
-            }
-
-            const btn = document.getElementById('btn-add-submit');
-            btn.disabled = true;
-            btn.textContent = 'Adding...';
-
-            const body = { type, local_addr: localAddr, persist };
-            if (type === 'http') {
-                body.subdomain = subdomain;
-            } else {
-                body.remote_port = remotePort;
-            }
-
-            fetch('/api/tunnels/add', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            })
-            .then(r => r.json())
-            .then(data => {
-                btn.disabled = false;
-                btn.textContent = 'Add Tunnel ⏎';
-
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    hideAddTunnelModal();
-                    loadTunnels();
-                }
-            })
-            .catch(err => {
-                btn.disabled = false;
-                btn.textContent = 'Add Tunnel ⏎';
-                alert('Error: ' + err.message);
-            });
-        }
-
-        function removeTunnel(tunnel) {
-            const name = tunnel.public_url || tunnel.subdomain || 'Port ' + tunnel.remote_port;
-            if (!confirm('Remove tunnel?\\n\\n' + name + ' → ' + tunnel.local_addr)) {
-                return;
-            }
-
-            const body = { type: tunnel.type, persist: true };
-            if (tunnel.type === 'http') {
-                body.subdomain = tunnel.subdomain;
-            } else {
-                body.remote_port = tunnel.remote_port;
-            }
-
-            fetch('/api/tunnels/remove', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    loadTunnels();
-                }
-            })
-            .catch(err => alert('Error: ' + err.message));
-        }
-
-        // ===== REQUEST LIST =====
-
-        function loadInitial() {
-            fetch('/api/requests')
-                .then(r => r.json())
-                .then(data => {
-                    requestsList = data || [];
-                    requestsList.forEach(r => requestsMap[r.id] = r);
-                    renderList();
-                });
-        }
-
-        function initSSE() {
-            const evtSource = new EventSource('/api/events');
-
-            evtSource.addEventListener('connected', function() {
-                sseConnected = true;
-                updateConnectionStatus(true);
-            });
-
-            evtSource.addEventListener('request', function(e) {
-                try {
-                    const req = JSON.parse(e.data);
-                    if (isPaused) {
-                        pausedQueue.push(req);
-                        updatePauseBadge(pausedQueue.length);
-                    } else {
-                        addRequest(req);
-                    }
-                } catch (err) {
-                    console.error('Failed to parse SSE:', err);
-                }
-            });
-
-            evtSource.onerror = function() {
-                sseConnected = false;
-                updateConnectionStatus(false);
-            };
-        }
-
-        function updateConnectionStatus(connected) {
-            const badge = document.getElementById('traffic-badge');
-            const dot = document.getElementById('connection-status');
-            const statusText = document.getElementById('tunnel-status-text');
-
-            if (connected) {
-                if (!connectionStartTime) {
-                    connectionStartTime = new Date();
-                }
-                lastHeartbeat = new Date();
-
-                badge.classList.remove('reconnecting');
-                badge.querySelector('span').textContent = 'Live';
-                dot.classList.remove('disconnected');
-                dot.title = getConnectionTooltip();
-                statusText.textContent = '● Connected';
-                statusText.style.color = 'var(--success)';
-            } else {
-                reconnectCount++;
-                connectionStartTime = null;
-
-                badge.classList.add('reconnecting');
-                badge.querySelector('span').textContent = 'Reconnecting...';
-                dot.classList.add('disconnected');
-                dot.title = 'Disconnected - Reconnect #' + reconnectCount;
-                statusText.textContent = '○ Reconnecting...';
-                statusText.style.color = 'var(--warning)';
-            }
-        }
-
-        function getConnectionTooltip() {
-            let tooltip = 'Connected';
-            if (lastHeartbeat) {
-                const ago = Math.round((new Date() - lastHeartbeat) / 1000);
-                tooltip += ' • Last heartbeat: ' + (ago < 2 ? 'just now' : ago + 's ago');
-            }
-            if (connectionStartTime) {
-                const uptime = Math.round((new Date() - connectionStartTime) / 1000);
-                tooltip += ' • Uptime: ' + formatUptime(uptime);
-            }
-            if (reconnectCount > 0) {
-                tooltip += ' • Reconnects: ' + reconnectCount;
-            }
-            return tooltip;
-        }
-
-        function formatUptime(seconds) {
-            if (seconds < 60) return seconds + 's';
-            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
-            const h = Math.floor(seconds / 3600);
-            const m = Math.floor((seconds % 3600) / 60);
-            return h + 'h ' + m + 'm';
-        }
-
-        // ===== NOTIFICATIONS =====
-
-        async function toggleNotifications() {
-            const btn = document.getElementById('btn-notify');
-
-            if (!notificationsEnabled) {
-                if ('Notification' in window) {
-                    const perm = await Notification.requestPermission();
-                    if (perm === 'granted') {
-                        notificationsEnabled = true;
-                        btn.classList.add('active');
-                        btn.title = 'Disable desktop notifications';
-                        showCopyToast('Notifications enabled for errors');
-                    } else {
-                        showCopyToast('Notification permission denied');
-                    }
-                } else {
-                    showCopyToast('Notifications not supported');
-                }
-            } else {
-                notificationsEnabled = false;
-                btn.classList.remove('active');
-                btn.title = 'Enable desktop notifications for errors';
-                showCopyToast('Notifications disabled');
-            }
-        }
-
-        function notifyError(req) {
-            if (notificationsEnabled && req.status >= 500) {
-                new Notification('Request Error', {
-                    body: req.method + ' ' + req.path + ' → ' + req.status,
-                    tag: req.id,
-                    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠️</text></svg>'
-                });
-            }
-        }
-
-        function exportHAR() {
-            const a = document.createElement('a');
-            a.href = '/api/export/har';
-            a.download = 'tunnel-requests.har';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            showCopyToast('HAR file downloaded');
-        }
-
-        // ===== PAUSE/RESUME =====
-
-        function togglePause() {
-            isPaused = !isPaused;
-            updatePauseButton();
-
-            if (!isPaused && pausedQueue.length > 0) {
-                pausedQueue.forEach(r => {
-                    requestsMap[r.id] = r;
-                    requestsList.unshift(r);
-                });
-                pausedQueue = [];
-                filterRequests();
-                showCopyToast('Resumed - ' + requestsList.length + ' requests');
-            } else if (isPaused) {
-                showCopyToast('Paused - new requests will queue');
-            }
-        }
-
-        function updatePauseButton() {
-            const btn = document.getElementById('btn-pause');
-            const icon = document.getElementById('pause-icon');
-            const badge = document.getElementById('pause-badge');
-
-            if (isPaused) {
-                btn.classList.add('paused');
-                icon.textContent = '▶';
-                btn.title = 'Resume live updates (Space)';
-            } else {
-                btn.classList.remove('paused');
-                icon.textContent = '⏸';
-                btn.title = 'Pause live updates (Space)';
-                badge.style.display = 'none';
-            }
-        }
-
-        function updatePauseBadge(count) {
-            const badge = document.getElementById('pause-badge');
-            if (isPaused && count > 0) {
-                badge.textContent = count > 99 ? '99+' : count;
-                badge.style.display = 'inline';
-            } else {
-                badge.style.display = 'none';
-            }
-        }
-
-        // ===== THEME TOGGLE =====
-
-        function toggleTheme() {
-            theme = theme === 'dark' ? 'light' : 'dark';
-            applyTheme();
-            localStorage.setItem('tunnel_theme', theme);
-            showCopyToast(theme === 'dark' ? 'Dark theme' : 'Light theme');
-        }
-
-        function applyTheme() {
-            document.documentElement.classList.toggle('light-theme', theme === 'light');
-            const icon = document.getElementById('theme-icon');
-            icon.textContent = theme === 'dark' ? '🌙' : '☀️';
-        }
-
-        // ===== KEYBOARD SHORTCUTS =====
-
-        function showShortcutsModal() {
-            document.getElementById('shortcuts-modal').classList.add('visible');
-        }
-
-        function closeShortcutsModal(event) {
-            if (event && event.target !== event.currentTarget) return;
-            document.getElementById('shortcuts-modal').classList.remove('visible');
-        }
-
-        function isInputFocused() {
-            const el = document.activeElement;
-            return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT');
-        }
-
-        function navigateRequest(direction) {
-            if (filteredRequestsList.length === 0) return;
-
-            let currentIndex = -1;
-            if (selectedId) {
-                currentIndex = filteredRequestsList.findIndex(r => r.id === selectedId);
-            }
-
-            let newIndex = currentIndex + direction;
-            if (newIndex < 0) newIndex = 0;
-            if (newIndex >= filteredRequestsList.length) newIndex = filteredRequestsList.length - 1;
-
-            if (newIndex !== currentIndex) {
-                selectRequest(filteredRequestsList[newIndex].id);
-            }
-        }
-
-        function addRequest(r) {
-            requestsMap[r.id] = r;
-            requestsList.unshift(r);
-            if (requestsList.length > 100) {
-                const removed = requestsList.pop();
-                delete requestsMap[removed.id];
-            }
-            // Re-apply filters
-            filterRequests();
-            // Notify on errors
-            notifyError(r);
-        }
-
-        function renderList() {
-            // Use filtered list
-            filterRequests();
-        }
-
-        function createRequestItem(r) {
-            const statusClass = r.status >= 500 ? 's-5xx' : (r.status >= 400 ? 's-4xx' : 's-2xx');
-
-            const item = document.createElement('div');
-            item.className = 'req-item' + (r.id === selectedId ? ' active' : '');
-            item.onclick = (e) => {
-                if (e.target.type !== 'checkbox') {
-                    selectRequest(r.id);
-                }
-            };
-
-            const checkbox = document.createElement('input');
-            checkbox.type = 'checkbox';
-            checkbox.className = 'diff-checkbox';
-            checkbox.checked = selectedForDiff.includes(r.id);
-            checkbox.onclick = (e) => {
-                e.stopPropagation();
-                toggleDiffSelection(r.id, e.target.checked);
-            };
-            item.appendChild(checkbox);
-
-            const dot = document.createElement('div');
-            dot.className = 'req-status-dot ' + statusClass;
-            item.appendChild(dot);
-
-            const info = document.createElement('div');
-            info.className = 'req-info';
-
-            const main = document.createElement('div');
-            main.className = 'req-main';
-
-            const method = document.createElement('span');
-            method.className = 'req-method ' + statusClass;
-            method.textContent = r.method;
-            main.appendChild(method);
-
-            const path = document.createElement('span');
-            path.className = 'req-path';
-            path.textContent = r.path;
-            main.appendChild(path);
-
-            info.appendChild(main);
-
-            const meta = document.createElement('div');
-            meta.className = 'req-meta';
-
-            const status = document.createElement('span');
-            status.textContent = r.status;
-            meta.appendChild(status);
-
-            const duration = document.createElement('span');
-            duration.textContent = r.duration;
-            meta.appendChild(duration);
-
-            const time = document.createElement('span');
-            time.textContent = new Date(r.timestamp).toLocaleTimeString();
-            meta.appendChild(time);
-
-            info.appendChild(meta);
-            item.appendChild(info);
-
-            return item;
-        }
-
-        function selectRequest(id) {
-            selectedId = id;
-            const r = requestsMap[id];
-            if (!r) return;
-
-            document.getElementById('empty-state').style.display = 'none';
-            document.getElementById('detail-view').classList.add('visible');
-
-            const statusClass = r.status >= 500 ? 's-5xx' : (r.status >= 400 ? 's-4xx' : 's-2xx');
-
-            const methodEl = document.getElementById('d-method');
-            methodEl.textContent = r.method;
-            methodEl.className = 'detail-method ' + statusClass;
-
-            document.getElementById('d-path').textContent = r.path;
-
-            const statusEl = document.getElementById('d-status');
-            statusEl.textContent = r.status;
-            statusEl.className = 'detail-status ' + statusClass;
-
-            document.getElementById('d-time').textContent = new Date(r.timestamp).toLocaleString();
-            document.getElementById('d-duration').textContent = r.duration;
-
-            renderHeaders('req', r.req_header);
-            renderHeaders('res', r.res_header);
-            renderBody('req', r.req_body, r.req_header ? r.req_header['Content-Type'] : '');
-            renderBody('res', r.res_body, r.content_type || (r.res_header ? r.res_header['Content-Type'] : ''));
-
-            document.getElementById('replay-result').classList.remove('visible');
-            renderList();
-        }
-
-        function replayRequest() {
-            if (!selectedId) return;
-
-            const btn = document.getElementById('btn-replay');
-            const resultDiv = document.getElementById('replay-result');
-            btn.disabled = true;
-            btn.textContent = '⏳ Replaying...';
-            resultDiv.classList.remove('visible');
-
-            fetch('/api/replay/' + selectedId, { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    btn.disabled = false;
-                    btn.textContent = '▶ Replay';
-                    resultDiv.classList.add('visible');
-
-                    if (data.error) {
-                        resultDiv.className = 'replay-result visible error';
-                        resultDiv.textContent = 'Error: ' + data.error;
-                    } else {
-                        resultDiv.className = 'replay-result visible success';
-                        resultDiv.textContent = '✓ Replay completed: ' + data.status + ' (' + data.duration + ')';
-                    }
-                })
-                .catch(err => {
-                    btn.disabled = false;
-                    btn.textContent = '▶ Replay';
-                    resultDiv.classList.add('visible');
-                    resultDiv.className = 'replay-result visible error';
-                    resultDiv.textContent = 'Error: ' + err.message;
-                });
-        }
-
-        function renderHeaders(type, headers) {
-            const container = document.getElementById(type + '-headers-list');
-            container.replaceChildren();
-
-            const entries = Object.entries(headers || {});
-            if (entries.length === 0) {
-                const empty = document.createElement('div');
-                empty.style.cssText = 'grid-column: span 2; color: var(--text-muted); font-style: italic;';
-                empty.textContent = 'No headers';
-                container.appendChild(empty);
-                return;
-            }
-
-            entries.forEach(([key, val]) => {
-                const keyDiv = document.createElement('div');
-                keyDiv.className = 'kv-key';
-                keyDiv.textContent = key + ':';
-                container.appendChild(keyDiv);
-
-                const valDiv = document.createElement('div');
-                valDiv.className = 'kv-val';
-                valDiv.textContent = val.join(', ');
-                container.appendChild(valDiv);
-            });
-        }
-
-        function renderBody(type, body, contentType) {
-            const el = document.getElementById(type + '-body-content');
-            if (!body) {
-                el.innerHTML = '<span style="color: var(--text-muted)">No content</span>';
-                return;
-            }
-
-            const parts = body.split('\\r\\n\\r\\n');
-            let content = parts.length > 1 ? parts.slice(1).join('\\r\\n\\r\\n') : body;
-
-            // Apply syntax highlighting
-            el.innerHTML = formatBody(content || body, contentType || '');
-        }
-
-        function switchTab(section, tabName) {
-            const headers = document.getElementById(section + '-headers');
-            const body = document.getElementById(section + '-body');
-            const tabs = event.target.parentNode;
-
-            Array.from(tabs.children).forEach(t => t.classList.remove('active'));
-            event.target.classList.add('active');
-
-            headers.classList.toggle('active', tabName === 'headers');
-            body.classList.toggle('active', tabName === 'body');
-        }
-
-        // ===== KEYBOARD SHORTCUTS =====
-
-        document.addEventListener('keydown', function(e) {
-            // Don't trigger shortcuts when typing in inputs
-            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-                if (e.key === 'Escape') {
-                    e.target.blur();
-                    hideAddTunnelModal();
-                    closeShortcutsModal();
-                }
-                return;
-            }
-
-            // ? - Show shortcuts
-            if (e.key === '?') {
-                e.preventDefault();
-                showShortcutsModal();
-                return;
-            }
-
-            // N - New tunnel
-            if (e.key === 'n' || e.key === 'N') {
-                e.preventDefault();
-                showAddTunnelModal();
-                return;
-            }
-
-            // Ctrl+K or Cmd+K - Focus filter
-            if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-                e.preventDefault();
-                const filter = document.getElementById('tunnel-filter-input');
-                if (tunnelsList.length > 5) {
-                    filter.focus();
-                }
-                return;
-            }
-
-            // J - Next request
-            if (e.key === 'j') {
-                e.preventDefault();
-                navigateRequest(1);
-                return;
-            }
-
-            // K - Previous request
-            if (e.key === 'k') {
-                e.preventDefault();
-                navigateRequest(-1);
-                return;
-            }
-
-            // R - Replay request
-            if (e.key === 'r' && selectedId) {
-                e.preventDefault();
-                replayRequest();
-                return;
-            }
-
-            // C - Copy as cURL
-            if (e.key === 'c' && selectedId) {
-                e.preventDefault();
-                copyAsCurl();
-                return;
-            }
-
-            // Space - Pause/resume
-            if (e.key === ' ') {
-                e.preventDefault();
-                togglePause();
-                return;
-            }
-
-            // T - Toggle theme
-            if (e.key === 't') {
-                e.preventDefault();
-                toggleTheme();
-                return;
-            }
-
-            // Escape - Close modals
-            if (e.key === 'Escape') {
-                hideAddTunnelModal();
-                closeShortcutsModal();
-                closeDiffModal();
-                closeQRModal();
-                closeWebhookModal();
-            }
-        });
-
-        // Initialize
-        loadTunnels();
-        loadInitial();
-        initSSE();
-        fetchMetrics();
-        applyTheme();
-
-        // Update connection tooltip every 5 seconds
-        setInterval(function() {
-            if (sseConnected) {
-                const dot = document.getElementById('connection-status');
-                if (dot) dot.title = getConnectionTooltip();
-            }
-        }, 5000);
-    </script>
-</body>
-</html>
-`
