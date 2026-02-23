@@ -133,6 +133,8 @@ Run on a machine with a public IP:
 
 See [INSTALL.md](INSTALL.md) for full server/client configuration examples.
 
+See [Custom Templates Guide](docs/CUSTOM_TEMPLATES.md) for creating custom dashboard templates.
+
 Run `tunnel <command> --help` for all available flags.
 
 ## Server APIs
