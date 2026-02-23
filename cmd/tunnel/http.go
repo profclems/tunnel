@@ -22,6 +22,10 @@ func newHTTPCmd() *cobra.Command {
 		inspect     bool
 		inspectPort int
 
+		// Inspector template options
+		template     string
+		templatePath string
+
 		// TLS options
 		tlsEnabled      bool
 		tlsInsecureSkip bool
@@ -67,6 +71,12 @@ func newHTTPCmd() *cobra.Command {
 			if tlsCAFile == "" {
 				tlsCAFile = viper.GetString("tls-ca")
 			}
+			if template == "" {
+				template = viper.GetString("template")
+			}
+			if templatePath == "" {
+				templatePath = viper.GetString("template-path")
+			}
 
 			localPort := args[0]
 			localAddr := localPort
@@ -91,6 +101,8 @@ func newHTTPCmd() *cobra.Command {
 				},
 				Inspect:         inspect,
 				InspectPort:     inspectPort,
+				Template:        template,
+				TemplatePath:    templatePath,
 				TLSEnabled:      tlsEnabled,
 				TLSInsecureSkip: tlsInsecureSkip,
 				TLSCertFile:     tlsCertFile,
@@ -121,6 +133,8 @@ func newHTTPCmd() *cobra.Command {
 	cmd.Flags().StringVar(&subdomain, "subdomain", "", "Requested subdomain (random if empty)")
 	cmd.Flags().BoolVar(&inspect, "inspect", false, "Enable request inspection dashboard")
 	cmd.Flags().IntVar(&inspectPort, "inspect-port", 4040, "Inspection dashboard port")
+	cmd.Flags().StringVar(&template, "template", "developer", "Dashboard template: only developer available")
+	cmd.Flags().StringVar(&templatePath, "template-path", "", "Path to custom template file (overrides --template)")
 
 	// TLS flags
 	cmd.Flags().BoolVar(&tlsEnabled, "tls", false, "Enable TLS for server connection")

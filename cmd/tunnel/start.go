@@ -28,6 +28,10 @@ type StartConfigYAML struct {
 	InspectPort int                `mapstructure:"inspect_port"`
 	Tunnels     []TunnelConfigYAML `mapstructure:"tunnels"`
 
+	// Inspector template options
+	Template     string `mapstructure:"template"`
+	TemplatePath string `mapstructure:"template_path"`
+
 	// TLS options
 	TLS         bool   `mapstructure:"tls"`
 	TLSInsecure bool   `mapstructure:"tls_insecure"`
@@ -146,6 +150,8 @@ Usage:
 				Tunnels:         tunnels,
 				Inspect:         cfg.Inspect,
 				InspectPort:     cfg.InspectPort,
+				Template:        cfg.Template,
+				TemplatePath:    cfg.TemplatePath,
 				TLSEnabled:      cfg.TLS,
 				TLSInsecureSkip: cfg.TLSInsecure,
 				TLSCertFile:     cfg.TLSCert,

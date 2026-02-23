@@ -107,6 +107,9 @@ Run on a machine with a public IP:
 
 # With inspection dashboard
 ./tunnel http 3000 --server "example.com:8081" --token "mysecret" --inspect
+
+# With custom dashboard template
+./tunnel http 3000 --server "example.com:8081" --token "mysecret" --inspect --template-path ./my-template.html
 ```
 
 ### Client - TCP Tunnel

@@ -98,6 +98,9 @@ token: "your-token"
 inspect: true
 inspect_port: 4040
 
+# Optional: Custom dashboard template (path to HTML file)
+# template_path: "./my-custom-template.html"
+
 tunnels:
   - type: http
     subdomain: web

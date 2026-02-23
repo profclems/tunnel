@@ -3,22 +3,20 @@ package client
 import (
 	"bytes"
 	"context"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/profclems/tunnel/client/templates"
 )
-
-//go:embed dashboard.html
-var dashboardHTML string
 
 // RequestRecord holds details of a captured request
 type RequestRecord struct {
@@ -166,6 +164,10 @@ type Inspector struct {
 	wsConnections   map[string]*WSConnection
 	wsMessagesMu    sync.RWMutex
 	wsConnectionsMu sync.RWMutex
+
+	// Template settings
+	template     string // Template name: developer, minimal, terminal, modern, monitoring
+	templatePath string // Custom template path (overrides template name)
 }
 
 // SetClient sets the client reference for tunnel management
@@ -178,8 +180,27 @@ func (i *Inspector) SetConfigManager(cm *ConfigManager) {
 	i.configMgr = cm
 }
 
-func NewInspector() *Inspector {
-	return &Inspector{
+// InspectorOption configures the Inspector
+type InspectorOption func(*Inspector)
+
+// WithTemplate sets the dashboard template
+func WithTemplate(name string) InspectorOption {
+	return func(i *Inspector) {
+		if templates.IsValidTemplate(name) {
+			i.template = name
+		}
+	}
+}
+
+// WithTemplatePath sets a custom template file path
+func WithTemplatePath(path string) InspectorOption {
+	return func(i *Inspector) {
+		i.templatePath = path
+	}
+}
+
+func NewInspector(opts ...InspectorOption) *Inspector {
+	i := &Inspector{
 		requests:       make([]*RequestRecord, 0),
 		maxSize:        100, // Keep last 100 requests
 		broadcast:      make(chan *RequestRecord, 10),
@@ -188,12 +209,41 @@ func NewInspector() *Inspector {
 		sharedRequests: make(map[string]*SharedRequest),
 		wsMessages:     make([]*WSMessage, 0),
 		wsConnections:  make(map[string]*WSConnection),
+		template:       "developer", // Default template
 		metrics: &InspectorMetrics{
 			latencyHistory: make([]LatencyPoint, 0, 60),
 			rateHistory:    make([]int, 60),
 			rateBuckets:    make(map[int64]int),
 		},
 	}
+
+	for _, opt := range opts {
+		opt(i)
+	}
+
+	return i
+}
+
+// renderTemplate returns the HTML for the current template
+func (i *Inspector) renderTemplate() string {
+	// Use custom template path if specified
+	if i.templatePath != "" {
+		data, err := os.ReadFile(i.templatePath)
+		if err == nil {
+			return string(data)
+		}
+		// Fall back to built-in template
+	}
+
+	// Load layout from embedded templates
+	layoutFile := "layouts/" + i.template + ".html"
+	layout, err := templates.LayoutHTML.ReadFile(layoutFile)
+	if err != nil {
+		// Fall back to developer template
+		layout, _ = templates.LayoutHTML.ReadFile("layouts/developer.html")
+	}
+
+	return string(layout)
 }
 
 // addSSEClient registers a new SSE client channel
@@ -1545,8 +1595,40 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		json.NewEncoder(w).Encode(map[string]string{"success": "true"})
 	})
 
+	// Static file handlers for template assets
+	mux.HandleFunc("/static/base.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(templates.BaseJS))
+	})
+
+	mux.HandleFunc("/static/theme.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css")
+		w.Header().Set("Cache-Control", "no-cache")
+		cssFile := "themes/" + i.template + ".css"
+		css, err := templates.ThemeCSS.ReadFile(cssFile)
+		if err != nil {
+			// Fall back to developer theme
+			css, _ = templates.ThemeCSS.ReadFile("themes/developer.css")
+		}
+		w.Write(css)
+	})
+
+	// Template info endpoint
+	mux.HandleFunc("/api/template", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"template":  i.template,
+			"available": templates.AvailableTemplates,
+		})
+	})
+
+	// Serve dashboard
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(dashboardHTML))
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(i.renderTemplate()))
 	})
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -1556,6 +1638,11 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 	}
 
 	fmt.Printf("\n--> Inspection Dashboard: http://%s\n", addr)
+	if i.templatePath != "" {
+		fmt.Printf("    Template: custom (%s)\n", i.templatePath)
+	} else {
+		fmt.Printf("    Template: %s\n", i.template)
+	}
 
 	// Start SSE broadcaster
 	go i.runSSEBroadcaster(ctx)

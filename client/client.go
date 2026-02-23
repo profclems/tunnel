@@ -40,6 +40,10 @@ type Config struct {
 	Inspect     bool
 	InspectPort int
 
+	// Inspector template options
+	Template     string // Template name: developer, minimal, terminal, modern, monitoring
+	TemplatePath string // Custom template file path (overrides Template)
+
 	// TLS options
 	TLSEnabled      bool   // Enable TLS for server connection
 	TLSInsecureSkip bool   // Skip server certificate verification
@@ -78,7 +82,14 @@ func NewClient(cfg Config, logger *slog.Logger) *Client {
 		pending: make(map[string]chan interface{}),
 	}
 	if cfg.Inspect {
-		c.inspector = NewInspector()
+		var opts []InspectorOption
+		if cfg.Template != "" {
+			opts = append(opts, WithTemplate(cfg.Template))
+		}
+		if cfg.TemplatePath != "" {
+			opts = append(opts, WithTemplatePath(cfg.TemplatePath))
+		}
+		c.inspector = NewInspector(opts...)
 	}
 	return c
 }

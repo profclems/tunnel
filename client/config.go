@@ -17,16 +17,18 @@ type ConfigManager struct {
 
 // TunnelConfigFile represents the YAML structure
 type TunnelConfigFile struct {
-	Server      string        `yaml:"server"`
-	Token       string        `yaml:"token"`
-	Inspect     bool          `yaml:"inspect,omitempty"`
-	InspectPort int           `yaml:"inspect_port,omitempty"`
-	TLS         bool          `yaml:"tls,omitempty"`
-	TLSInsecure bool          `yaml:"tls_insecure,omitempty"`
-	TLSCert     string        `yaml:"tls_cert,omitempty"`
-	TLSKey      string        `yaml:"tls_key,omitempty"`
-	TLSCA       string        `yaml:"tls_ca,omitempty"`
-	Tunnels     []TunnelEntry `yaml:"tunnels"`
+	Server       string        `yaml:"server"`
+	Token        string        `yaml:"token"`
+	Inspect      bool          `yaml:"inspect,omitempty"`
+	InspectPort  int           `yaml:"inspect_port,omitempty"`
+	Template     string        `yaml:"template,omitempty"`      // Inspector template: minimal|developer|terminal|modern|monitoring
+	TemplatePath string        `yaml:"template_path,omitempty"` // Custom template file path
+	TLS          bool          `yaml:"tls,omitempty"`
+	TLSInsecure  bool          `yaml:"tls_insecure,omitempty"`
+	TLSCert      string        `yaml:"tls_cert,omitempty"`
+	TLSKey       string        `yaml:"tls_key,omitempty"`
+	TLSCA        string        `yaml:"tls_ca,omitempty"`
+	Tunnels      []TunnelEntry `yaml:"tunnels"`
 }
 
 // TunnelEntry represents a tunnel in the config file

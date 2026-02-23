@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tunnel Inspector</title>
+    <link rel="stylesheet" href="/static/theme.css">
+</head>
+<body>
+    <div class="sidebar">
+        <!-- Tunnel Panel -->
+        <div class="tunnel-panel" id="tunnel-panel">
+            <div class="tunnel-panel-header" onclick="toggleTunnelPanel()">
+                <div class="tunnel-panel-title">
+                    <span class="chevron">▼</span>
+                    <span>Tunnels</span>
+                    <span class="tunnel-count" id="tunnel-count">0</span>
+                </div>
+                <div class="tunnel-panel-actions" onclick="event.stopPropagation()">
+                    <div class="tunnel-status-dot" id="connection-status" title="Connected"></div>
+                    <button class="btn-new-tunnel" onclick="showAddTunnelModal()" title="Add new tunnel">
+                        <span>+</span> New
+                        <span class="kbd">N</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="tunnel-panel-body">
+                <div class="tunnel-filter" id="tunnel-filter">
+                    <input type="text" class="tunnel-filter-input" id="tunnel-filter-input"
+                           placeholder="Filter tunnels... (Ctrl+K)"
+                           oninput="filterTunnels(this.value)" aria-label="Filter tunnels">
+                </div>
+
+                <div id="tunnel-content">
+                    <!-- Tunnel groups rendered here -->
+                </div>
+            </div>
+
+            <div class="tunnel-footer">
+                <div class="tunnel-footer-left">
+                    <div class="tunnel-footer-status">
+                        <span id="tunnel-status-text">● Connected</span>
+                    </div>
+                </div>
+                <div class="tunnel-footer-right">
+                    <span class="tunnel-footer-config" id="config-path" title="Config file">~/.tunnel/tunnel.yaml</span>
+                    <button class="btn-reload" onclick="loadTunnels()" title="Reload tunnels">⟳</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Metrics Panel -->
+        <div class="metrics-panel" id="metrics-panel">
+            <div class="metrics-panel-header" onclick="toggleMetricsPanel()">
+                <span class="metrics-panel-title">📊 Metrics</span>
+                <span class="chevron" id="metrics-chevron">▼</span>
+            </div>
+            <div class="metrics-panel-body" id="metrics-body">
+                <div class="metrics-charts">
+                    <div class="metrics-chart-container">
+                        <div class="metrics-chart-label">Latency (ms)</div>
+                        <div class="metrics-chart" id="latency-chart">
+                            <svg id="latency-svg"></svg>
+                        </div>
+                    </div>
+                    <div class="metrics-chart-container">
+                        <div class="metrics-chart-label">Rate (req/s)</div>
+                        <div class="metrics-chart rate-chart" id="rate-chart">
+                            <svg id="rate-svg"></svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="metrics-stats">
+                    <span class="metrics-stat"><span class="down">↓</span> <span id="bytes-in">0 B</span></span>
+                    <span class="metrics-stat"><span class="up">↑</span> <span id="bytes-out">0 B</span></span>
+                    <span class="metrics-stat"><span id="req-rate">0</span> req/min</span>
+                    <span class="metrics-stat"><span class="err" id="error-count">0</span> errors</span>
+                </div>
+                <div class="metrics-percentiles">
+                    <span>p50: <b id="p50-latency">--</b>ms</span>
+                    <span>p95: <b id="p95-latency">--</b>ms</span>
+                    <span>p99: <b id="p99-latency">--</b>ms</span>
+                </div>
+
+                <!-- Error Breakdown -->
+                <div class="metrics-subsection" id="error-breakdown" style="display:none;">
+                    <div class="metrics-subsection-header" onclick="toggleErrorBreakdown()">
+                        <span>⚠️ Error Breakdown</span>
+                        <span class="chevron" id="error-chevron">▼</span>
+                    </div>
+                    <div class="error-breakdown-body" id="error-breakdown-body">
+                        <div id="error-bars"></div>
+                    </div>
+                </div>
+
+                <!-- Latency Histogram -->
+                <div class="metrics-subsection">
+                    <div class="metrics-subsection-header" onclick="toggleHistogram()">
+                        <span>📈 Response Time Distribution</span>
+                        <span class="chevron" id="histogram-chevron">▶</span>
+                    </div>
+                    <div class="histogram-body collapsed" id="histogram-body">
+                        <div id="histogram-bars"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Traffic Section -->
+        <div class="traffic-header">
+            <h1>Traffic</h1>
+            <div class="traffic-header-actions">
+                <button class="btn-theme" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme">
+                    <span id="theme-icon">🌙</span>
+                </button>
+                <button class="btn-export-har" onclick="exportHAR()" title="Export as HAR file">
+                    <span>📥</span>
+                </button>
+                <button class="btn-notify" id="btn-notify" onclick="toggleNotifications()" title="Enable desktop notifications for errors">
+                    <span class="notify-icon">🔔</span>
+                </button>
+                <button class="btn-pause" id="btn-pause" onclick="togglePause()" title="Pause/resume live updates (Space)">
+                    <span id="pause-icon">⏸</span><span id="pause-badge" class="pause-badge" style="display:none">0</span>
+                </button>
+                <span id="pinned-count" class="pinned-count" style="display:none" title="Pinned requests">📌 <span id="pinned-num">0</span></span>
+                <button class="btn-clear-session" id="btn-clear-session" onclick="clearSession()" title="Clear session data" style="display:none">🗑️</button>
+                <div class="traffic-live-badge" id="traffic-badge">
+                    <div class="traffic-live-dot"></div>
+                    <span>Live</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filter Bar -->
+        <div class="filter-bar">
+            <input type="text" class="filter-input" id="req-filter-input"
+                   placeholder="Filter by path..." oninput="filterRequests()" aria-label="Filter by path">
+            <select class="filter-select" id="method-filter" onchange="filterRequests()" aria-label="Filter by HTTP method">
+                <option value="">All Methods</option>
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+                <option value="PUT">PUT</option>
+                <option value="DELETE">DELETE</option>
+                <option value="PATCH">PATCH</option>
+            </select>
+            <select class="filter-select" id="status-filter" onchange="filterRequests()" aria-label="Filter by status code">
+                <option value="">All Status</option>
+                <option value="2xx">2xx Success</option>
+                <option value="4xx">4xx Client Error</option>
+                <option value="5xx">5xx Server Error</option>
+            </select>
+            <button class="btn-group-toggle" id="btn-group-toggle" onclick="toggleGrouping()" title="Group requests by path">
+                <span id="group-icon">📁</span>
+            </button>
+            <button class="btn-ws-toggle" id="btn-ws-toggle" onclick="toggleWSPanel()" title="WebSocket Messages">
+                🔌 WS <span id="ws-count" class="ws-count">0</span>
+            </button>
+        </div>
+
+        <!-- WebSocket Messages Panel -->
+        <div id="ws-panel" class="ws-panel" style="display: none;">
+            <div class="ws-panel-header">
+                <span>WebSocket Messages</span>
+                <div class="ws-panel-actions">
+                    <button onclick="refreshWSMessages()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">🔄</button>
+                    <button onclick="clearWSMessages()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">🗑️</button>
+                    <button onclick="toggleWSPanel()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">✕</button>
+                </div>
+            </div>
+            <div id="ws-messages-list" class="ws-messages-list">
+                <div class="ws-empty">No WebSocket messages captured yet</div>
+            </div>
+        </div>
+
+        <!-- Compare Bar -->
+        <div id="compare-bar" class="compare-bar">
+            <span class="compare-bar-info"><span id="compare-count">0</span> requests selected for comparison</span>
+            <div class="compare-bar-actions">
+                <button class="btn-clear-compare" onclick="clearDiffSelection()">Clear</button>
+                <button class="btn-compare" id="btn-compare" onclick="showDiffModal()">Compare</button>
+            </div>
+        </div>
+
+        <div id="req-list" class="req-list"></div>
+    </div>
+
+    <!-- Add Tunnel Modal -->
+    <div class="modal-overlay" id="add-tunnel-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>New Tunnel</h2>
+                <button class="modal-close" onclick="hideAddTunnelModal()">✕</button>
+            </div>
+            <form onsubmit="submitAddTunnel(event)">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label class="form-label">Type</label>
+                        <div class="form-type-selector">
+                            <label class="form-type-option selected" id="type-http">
+                                <input type="radio" name="tunnel-type" value="http" checked onchange="updateFormFields()">
+                                <div class="type-label">HTTP</div>
+                                <div class="type-desc">Web traffic</div>
+                            </label>
+                            <label class="form-type-option" id="type-tcp">
+                                <input type="radio" name="tunnel-type" value="tcp" onchange="updateFormFields()">
+                                <div class="type-label">TCP</div>
+                                <div class="type-desc">Raw TCP/SSH</div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-group" id="subdomain-group">
+                        <label class="form-label" for="tunnel-subdomain">Subdomain <span style="color: var(--text-muted)">(optional)</span></label>
+                        <input type="text" class="form-input" id="tunnel-subdomain" placeholder="my-app" oninput="updatePreview()">
+                        <div class="form-preview" id="subdomain-preview">→ random.px.csam.dev</div>
+                    </div>
+
+                    <div class="form-group" id="port-group" style="display: none;">
+                        <label class="form-label" for="tunnel-port">Remote Port <span style="color: var(--text-muted)">(0 = random)</span></label>
+                        <input type="number" class="form-input" id="tunnel-port" placeholder="0" min="0" max="65535" value="0">
+                        <div class="form-hint">Server will assign an available port if 0</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="tunnel-local">Local Address</label>
+                        <input type="text" class="form-input" id="tunnel-local" placeholder="127.0.0.1:3000" required>
+                        <div class="form-hint">The local service to forward traffic to</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-checkbox">
+                            <input type="checkbox" id="tunnel-persist" checked>
+                            <span>Save to config file</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn-modal-cancel" onclick="hideAddTunnelModal()">
+                        Cancel <span class="kbd">Esc</span>
+                    </button>
+                    <button type="submit" class="btn-modal-submit" id="btn-add-submit">
+                        Add Tunnel <span class="kbd">⏎</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main">
+        <div id="empty-state" class="empty-state">
+            <div class="empty-state-icon">📡</div>
+            <div>Select a request to inspect details</div>
+        </div>
+
+        <div id="detail-view" class="detail-view">
+            <div class="detail-header">
+                <div class="detail-title">
+                    <span id="d-method" class="detail-method">GET</span>
+                    <span id="d-path" class="detail-path">/path</span>
+                </div>
+                <div class="detail-meta">
+                    <span id="d-status" class="detail-status">200</span>
+                    <span id="d-time">12:00:00</span>
+                    <span id="d-duration">120ms</span>
+                    <button id="btn-replay" class="btn-replay" onclick="replayRequest()">▶ Replay</button>
+                    <button id="btn-annotate" class="btn-annotate" onclick="showAnnotationModal(selectedId)" title="Add note/tags">📝</button>
+                    <div class="export-dropdown">
+                        <button class="btn-export" onclick="toggleExportMenu()">⤓ Export</button>
+                        <div class="export-menu" id="export-menu">
+                            <div class="export-option" onclick="copyAsCurl()">Copy as cURL</div>
+                            <div class="export-option" onclick="copyAsFetch()">Copy as fetch</div>
+                        </div>
+                    </div>
+                    <button id="btn-mock" class="btn-mock" onclick="createMockFromRequest()" title="Create mock from this request">🎭</button>
+                    <button id="btn-share" class="btn-share" onclick="shareRequest()" title="Share this request">🔗</button>
+                </div>
+                <div id="annotation-display" class="annotation-display" style="display: none;"></div>
+                <div id="replay-result" class="replay-result"></div>
+            </div>
+
+            <div class="detail-content">
+                <div class="detail-section">
+                    <div class="section-title">Request</div>
+                    <div class="tabs">
+                        <div class="tab active" onclick="switchTab('req', 'headers')">Headers</div>
+                        <div class="tab" onclick="switchTab('req', 'body')">Body</div>
+                    </div>
+                    <div id="req-headers" class="tab-content active">
+                        <div id="req-headers-list" class="kv-grid"></div>
+                    </div>
+                    <div id="req-body" class="tab-content">
+                        <pre id="req-body-content"></pre>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">Response</div>
+                    <div class="tabs">
+                        <div class="tab active" onclick="switchTab('res', 'headers')">Headers</div>
+                        <div class="tab" onclick="switchTab('res', 'body')">Body</div>
+                    </div>
+                    <div id="res-headers" class="tab-content active">
+                        <div id="res-headers-list" class="kv-grid"></div>
+                    </div>
+                    <div id="res-body" class="tab-content">
+                        <pre id="res-body-content"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Diff Modal -->
+    <div id="diff-modal" class="diff-modal" onclick="closeDiffModal(event)">
+        <div class="diff-modal-content" onclick="event.stopPropagation()">
+            <div class="diff-modal-header">
+                <span class="diff-modal-title">Request Comparison</span>
+                <button class="diff-modal-close" onclick="closeDiffModal()">&times;</button>
+            </div>
+            <div class="diff-tabs">
+                <div class="diff-tab active" data-diff-tab="url" onclick="switchDiffTab('url')">URL & Method</div>
+                <div class="diff-tab" data-diff-tab="headers" onclick="switchDiffTab('headers')">Headers</div>
+                <div class="diff-tab" data-diff-tab="body" onclick="switchDiffTab('body')">Body</div>
+            </div>
+            <div class="diff-body">
+                <div class="diff-pane">
+                    <div class="diff-pane-header" id="diff-left-header">Request 1</div>
+                    <div id="diff-left-content"></div>
+                </div>
+                <div class="diff-pane">
+                    <div class="diff-pane-header" id="diff-right-header">Request 2</div>
+                    <div id="diff-right-content"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- QR Code Modal -->
+    <div id="qr-modal" class="qr-modal" onclick="closeQRModal(event)">
+        <div class="qr-modal-content" onclick="event.stopPropagation()">
+            <div class="qr-modal-title">Scan to Open</div>
+            <div class="qr-container">
+                <canvas id="qr-canvas" width="200" height="200"></canvas>
+            </div>
+            <div class="qr-url" id="qr-url"></div>
+            <button class="qr-modal-close" onclick="closeQRModal()">Close</button>
+        </div>
+    </div>
+
+    <!-- Webhook Tester Modal -->
+    <div id="webhook-modal" class="webhook-modal" onclick="closeWebhookModal(event)">
+        <div class="webhook-modal-content" onclick="event.stopPropagation()">
+            <div class="webhook-modal-header">
+                <span class="webhook-modal-title">Webhook Tester</span>
+                <button class="webhook-modal-close" onclick="closeWebhookModal()">&times;</button>
+            </div>
+            <div class="webhook-form">
+                <div class="webhook-templates-row" style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center;">
+                    <select id="webhook-template-select" class="webhook-method" style="flex: 1;" onchange="loadTemplate(this.value)" aria-label="Select template">
+                        <option value="">-- Templates --</option>
+                    </select>
+                    <button onclick="saveAsTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;">💾 Save</button>
+                    <button onclick="deleteTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;">🗑️</button>
+                </div>
+                <div class="webhook-row">
+                    <select id="webhook-method" class="webhook-method" aria-label="HTTP method">
+                        <option value="GET">GET</option>
+                        <option value="POST" selected>POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="PATCH">PATCH</option>
+                        <option value="DELETE">DELETE</option>
+                    </select>
+                    <input type="text" id="webhook-url" class="webhook-url" placeholder="https://your-tunnel.example.com/webhook" aria-label="Webhook URL">
+                </div>
+                <div class="webhook-label">Headers (JSON)</div>
+                <textarea id="webhook-headers" class="webhook-headers" placeholder='{"Content-Type": "application/json"}' aria-label="Request headers"></textarea>
+                <div class="webhook-label">Body</div>
+                <textarea id="webhook-body" class="webhook-body" placeholder='{"event": "test", "data": {}}' aria-label="Request body"></textarea>
+                <div class="webhook-actions">
+                    <button id="btn-webhook-send" class="btn-webhook-send" onclick="sendWebhookTest()">Send Request</button>
+                </div>
+                <div id="webhook-response" class="webhook-response">
+                    <div class="webhook-response-header">
+                        <span id="webhook-response-status" class="webhook-response-status"></span>
+                        <span id="webhook-response-time" class="webhook-response-time"></span>
+                    </div>
+                    <pre id="webhook-response-body" class="webhook-response-body"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Keyboard Shortcuts Modal -->
+    <div id="shortcuts-modal" class="shortcuts-modal" onclick="closeShortcutsModal(event)">
+        <div class="shortcuts-modal-content" onclick="event.stopPropagation()">
+            <div class="shortcuts-modal-header">
+                <span class="shortcuts-modal-title">Keyboard Shortcuts</span>
+                <button class="shortcuts-modal-close" onclick="closeShortcutsModal()">&times;</button>
+            </div>
+            <div class="shortcuts-grid">
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Show shortcuts</span>
+                    <span class="shortcut-key">?</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">New tunnel</span>
+                    <span class="shortcut-key">N</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Focus filter</span>
+                    <span class="shortcut-key">Ctrl+K</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Close modal</span>
+                    <span class="shortcut-key">Esc</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Next request</span>
+                    <span class="shortcut-key">J</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Previous request</span>
+                    <span class="shortcut-key">K</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Replay request</span>
+                    <span class="shortcut-key">R</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Copy as cURL</span>
+                    <span class="shortcut-key">C</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Pause/resume</span>
+                    <span class="shortcut-key">Space</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Toggle theme</span>
+                    <span class="shortcut-key">T</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Pin request</span>
+                    <span class="shortcut-key">P</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-desc">Annotate</span>
+                    <span class="shortcut-key">A</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/base.js"></script>
+</body>
+</html>
