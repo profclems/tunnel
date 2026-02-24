@@ -54,6 +54,44 @@
             if (el) el.classList.toggle(cls, force);
         }
 
+        // ===== SVG ICONS =====
+        // Static SVG icon definitions (safe - not user input)
+        const icons = {
+            lock: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/></svg>',
+            unlock: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 0 1 6 0"/></svg>',
+            close: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+            check: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4 4 6-8"/></svg>',
+            link: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 10l4-4"/><path d="M9 4.5h2.5v2.5"/><path d="M7 11.5H4.5V9"/></svg>',
+            chart: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 13V8M8 13V3M13 13V6"/></svg>',
+            warning: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2L1.5 13h13L8 2z"/><path d="M8 6v3M8 11v.5"/></svg>',
+            refresh: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 8a6 6 0 0 1 10.5-4M14 8a6 6 0 0 1-10.5 4"/><path d="M12 1v4h-4M4 15v-4h4"/></svg>',
+            trash: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4h10M6 4V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1M5 4v9a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V4"/></svg>',
+            mask: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><circle cx="6" cy="7" r="1.5"/><circle cx="10" cy="7" r="1.5"/><path d="M5 10.5c1 1 4 1 6 0"/></svg>',
+            note: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="2" width="10" height="12" rx="1"/><path d="M6 5h4M6 8h4M6 11h2"/></svg>',
+            tunnel: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12h16M8 8l-4 4 4 4M16 8l4 4-4 4"/></svg>',
+            copy: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="8" height="9" rx="1"/><path d="M3 11V4a1 1 0 0 1 1-1h6"/></svg>',
+            qr: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="10" y="10" width="3" height="3"/></svg>',
+            bolt: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2L4 9h4l-1 5 5-7H8l1-5z"/></svg>',
+            terminal: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 5l3 3-3 3M8 11h4"/></svg>',
+            external: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 9v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h4"/><path d="M9 2h5v5M7 9l6-6"/></svg>'
+        };
+
+        function icon(name, size) {
+            const svg = icons[name] || '';
+            if (size && svg) {
+                return svg.replace(/width="\d+"/, 'width="' + size + '"').replace(/height="\d+"/, 'height="' + size + '"');
+            }
+            return svg;
+        }
+
+        function iconEl(name, size) {
+            const span = document.createElement('span');
+            span.className = 'icon icon-' + name;
+            // Safe: icons[name] contains only static SVG strings defined above
+            span.innerHTML = icon(name, size);
+            return span;
+        }
+
         // ===== METRICS =====
 
         function fetchMetrics() {
@@ -1174,7 +1212,7 @@
             if (tunnel.has_basic_auth) {
                 const authBadge = document.createElement('span');
                 authBadge.className = 'tunnel-auth-badge';
-                authBadge.textContent = '🔒';
+                authBadge.appendChild(iconEl('lock'));
                 authBadge.title = 'Protected with Basic Auth';
                 mainRow.appendChild(authBadge);
             }
@@ -1185,21 +1223,21 @@
 
             const copyBtn = document.createElement('button');
             copyBtn.className = 'tunnel-action-btn';
-            copyBtn.textContent = '⎘';
+            copyBtn.appendChild(iconEl('copy'));
             copyBtn.title = 'Copy URL';
             copyBtn.onclick = (e) => { e.stopPropagation(); copyTunnelUrl(tunnel, copyBtn); };
             actions.appendChild(copyBtn);
 
             const cmdBtn = document.createElement('button');
             cmdBtn.className = 'tunnel-action-btn';
-            cmdBtn.textContent = type === 'http' ? '⧉' : '⌘';
+            cmdBtn.appendChild(iconEl(type === 'http' ? 'external' : 'terminal'));
             cmdBtn.title = type === 'http' ? 'Copy curl command' : 'Copy SSH command';
             cmdBtn.onclick = (e) => { e.stopPropagation(); copyTunnelCommand(tunnel, cmdBtn); };
             actions.appendChild(cmdBtn);
 
             const qrBtn = document.createElement('button');
             qrBtn.className = 'tunnel-action-btn';
-            qrBtn.textContent = '⊞';
+            qrBtn.appendChild(iconEl('qr'));
             qrBtn.title = 'Show QR code';
             qrBtn.onclick = (e) => { e.stopPropagation(); showQRCode(tunnel.public_url); };
             actions.appendChild(qrBtn);
@@ -1207,7 +1245,7 @@
             if (type === 'http') {
                 const testBtn = document.createElement('button');
                 testBtn.className = 'tunnel-action-btn';
-                testBtn.textContent = '⚡';
+                testBtn.appendChild(iconEl('bolt'));
                 testBtn.title = 'Test webhook';
                 testBtn.onclick = (e) => { e.stopPropagation(); showWebhookTester(tunnel.public_url); };
                 actions.appendChild(testBtn);
@@ -1215,7 +1253,7 @@
 
             const removeBtn = document.createElement('button');
             removeBtn.className = 'tunnel-action-btn remove';
-            removeBtn.textContent = '✕';
+            removeBtn.appendChild(iconEl('close'));
             removeBtn.title = 'Remove tunnel';
             removeBtn.onclick = (e) => { e.stopPropagation(); removeTunnel(tunnel); };
             actions.appendChild(removeBtn);
@@ -1252,10 +1290,10 @@
             const empty = document.createElement('div');
             empty.className = 'tunnel-empty';
 
-            const icon = document.createElement('div');
-            icon.className = 'tunnel-empty-icon';
-            icon.textContent = '🚇';
-            empty.appendChild(icon);
+            const emptyIcon = document.createElement('div');
+            emptyIcon.className = 'tunnel-empty-icon';
+            emptyIcon.appendChild(iconEl('tunnel', 32));
+            empty.appendChild(emptyIcon);
 
             const title = document.createElement('div');
             title.className = 'tunnel-empty-title';
@@ -1306,10 +1344,10 @@
 
             navigator.clipboard.writeText(url).then(() => {
                 btn.classList.add('copy-success');
-                btn.textContent = '✓';
+                btn.innerHTML = icon('check');
                 setTimeout(() => {
                     btn.classList.remove('copy-success');
-                    btn.textContent = '⎘';
+                    btn.innerHTML = icon('copy');
                 }, 1500);
             });
         }
@@ -1326,10 +1364,10 @@
 
             navigator.clipboard.writeText(cmd).then(() => {
                 btn.classList.add('copy-success');
-                btn.textContent = '✓';
+                btn.innerHTML = icon('check');
                 setTimeout(() => {
                     btn.classList.remove('copy-success');
-                    btn.textContent = tunnel.type === 'http' ? '⧉' : '⌘';
+                    btn.innerHTML = tunnel.type === 'http' ? icon('external') : icon('terminal');
                 }, 1500);
             });
         }
@@ -2052,7 +2090,7 @@
             if (hasAnnotation) {
                 const noteIcon = document.createElement('span');
                 noteIcon.className = 'req-annotation-icon';
-                noteIcon.textContent = '📝';
+                noteIcon.appendChild(iconEl('note'));
                 noteIcon.title = hasAnnotation.note || 'Has annotation';
                 path.appendChild(noteIcon);
             }
@@ -2060,7 +2098,7 @@
             if (r.auth_required) {
                 const authIcon = document.createElement('span');
                 authIcon.className = 'req-auth-icon ' + (r.authenticated ? 'auth-ok' : 'auth-denied');
-                authIcon.textContent = r.authenticated ? '🔓' : '🔒';
+                authIcon.appendChild(iconEl(r.authenticated ? 'unlock' : 'lock'));
                 authIcon.title = r.authenticated
                     ? 'Authenticated' + (r.auth_user ? ' as ' + r.auth_user : '')
                     : 'Auth denied: ' + (r.auth_denied_reason || 'unauthorized');
@@ -2124,7 +2162,111 @@
 
             document.getElementById('replay-result').classList.remove('visible');
             renderList();
+
+            // On mobile, switch to detail view
+            if (window.innerWidth <= 768) {
+                mobileShowDetail();
+            }
         }
+
+        // ===== MOBILE NAVIGATION =====
+        let touchStartX = 0;
+        let touchStartY = 0;
+        let touchEndX = 0;
+        let touchEndY = 0;
+        const SWIPE_THRESHOLD = 80;
+        const SWIPE_VELOCITY_THRESHOLD = 0.3;
+        let touchStartTime = 0;
+
+        function isMobile() {
+            return window.innerWidth <= 768;
+        }
+
+        function mobileShowDetail() {
+            if (!isMobile()) return;
+            document.querySelector('.sidebar').classList.add('mobile-hidden');
+            document.querySelector('.main').classList.add('mobile-visible');
+            document.getElementById('mobile-back-btn').classList.add('visible');
+            document.getElementById('mobile-title').textContent = 'Request Details';
+        }
+
+        function mobileShowList() {
+            if (!isMobile()) return;
+            document.querySelector('.sidebar').classList.remove('mobile-hidden');
+            document.querySelector('.main').classList.remove('mobile-visible');
+            document.getElementById('mobile-back-btn').classList.remove('visible');
+            document.getElementById('mobile-title').textContent = 'Traffic';
+        }
+
+        function mobileToggleMenu() {
+            const overlay = document.getElementById('mobile-menu-overlay');
+            overlay.classList.toggle('visible');
+        }
+
+        function mobileShowTunnels() {
+            mobileToggleMenu();
+            mobileShowList();
+            // Scroll to tunnels section
+            document.getElementById('tunnel-panel').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function mobileShowMetrics() {
+            mobileToggleMenu();
+            mobileShowList();
+            // Scroll to metrics section
+            document.getElementById('metrics-panel').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Touch swipe handling
+        function handleTouchStart(e) {
+            if (!isMobile()) return;
+            touchStartX = e.changedTouches[0].screenX;
+            touchStartY = e.changedTouches[0].screenY;
+            touchStartTime = Date.now();
+        }
+
+        function handleTouchEnd(e) {
+            if (!isMobile()) return;
+            touchEndX = e.changedTouches[0].screenX;
+            touchEndY = e.changedTouches[0].screenY;
+            handleSwipe();
+        }
+
+        function handleSwipe() {
+            const deltaX = touchEndX - touchStartX;
+            const deltaY = touchEndY - touchStartY;
+            const deltaTime = Date.now() - touchStartTime;
+            const velocity = Math.abs(deltaX) / deltaTime;
+
+            // Only handle horizontal swipes (ignore vertical scrolling)
+            if (Math.abs(deltaX) < Math.abs(deltaY)) return;
+
+            // Check if swipe meets threshold
+            if (Math.abs(deltaX) < SWIPE_THRESHOLD && velocity < SWIPE_VELOCITY_THRESHOLD) return;
+
+            const mainVisible = document.querySelector('.main').classList.contains('mobile-visible');
+
+            if (deltaX > 0 && mainVisible) {
+                // Swipe right - go back to list
+                mobileShowList();
+            } else if (deltaX < 0 && !mainVisible && selectedId) {
+                // Swipe left - show detail (if a request is selected)
+                mobileShowDetail();
+            }
+        }
+
+        // Initialize mobile touch handlers
+        document.addEventListener('touchstart', handleTouchStart, { passive: true });
+        document.addEventListener('touchend', handleTouchEnd, { passive: true });
+
+        // Handle window resize - reset mobile state when switching to desktop
+        window.addEventListener('resize', function() {
+            if (!isMobile()) {
+                document.querySelector('.sidebar').classList.remove('mobile-hidden');
+                document.querySelector('.main').classList.remove('mobile-visible');
+                document.getElementById('mobile-menu-overlay').classList.remove('visible');
+            }
+        });
 
         function replayRequest() {
             if (!selectedId) return;
@@ -2147,7 +2289,7 @@
                         resultDiv.textContent = 'Error: ' + data.error;
                     } else {
                         resultDiv.className = 'replay-result visible success';
-                        resultDiv.textContent = '✓ Replay completed: ' + data.status + ' (' + data.duration + ')';
+                        resultDiv.innerHTML = icon('check') + ' Replay completed: ' + data.status + ' (' + data.duration + ')';
                     }
                 })
                 .catch(err => {
@@ -2295,7 +2437,7 @@
             .then(r => r.json())
             .then(data => {
                 btn.disabled = false;
-                btn.textContent = '🔗';
+                btn.innerHTML = icon('link');
 
                 if (data.error) {
                     showCopyToast('Error: ' + data.error);
@@ -2307,7 +2449,7 @@
             })
             .catch(err => {
                 btn.disabled = false;
-                btn.textContent = '🔗';
+                btn.innerHTML = icon('link');
                 showCopyToast('Error: ' + err.message);
             });
         }
@@ -2497,8 +2639,18 @@
                 return;
             }
 
-            // Escape - Close modals
+            // Escape - Close modals or go back on mobile
             if (e.key === 'Escape') {
+                // On mobile, if detail view is showing, go back to list
+                if (isMobile() && document.querySelector('.main').classList.contains('mobile-visible')) {
+                    mobileShowList();
+                    return;
+                }
+                // Close any open menus/modals
+                if (document.getElementById('mobile-menu-overlay').classList.contains('visible')) {
+                    mobileToggleMenu();
+                    return;
+                }
                 hideAddTunnelModal();
                 closeShortcutsModal();
                 closeDiffModal();

@@ -7,6 +7,46 @@
     <link rel="stylesheet" href="/static/theme.css">
 </head>
 <body>
+    <!-- Mobile Navigation Header (hidden on desktop) -->
+    <div class="mobile-header" id="mobile-header">
+        <button class="mobile-back-btn" id="mobile-back-btn" onclick="mobileShowList()">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 12L6 8L10 4"/>
+            </svg>
+            Back
+        </button>
+        <span class="mobile-title" id="mobile-title">Traffic</span>
+        <button class="mobile-menu-btn" id="mobile-menu-btn" onclick="mobileToggleMenu()">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M3 5H17M3 10H17M3 15H17"/>
+            </svg>
+        </button>
+    </div>
+
+    <!-- Mobile Menu Overlay -->
+    <div class="mobile-menu-overlay" id="mobile-menu-overlay" onclick="mobileToggleMenu()">
+        <div class="mobile-menu" onclick="event.stopPropagation()">
+            <div class="mobile-menu-item" onclick="mobileShowTunnels()">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 3L3 6L6 9M10 7L13 10L10 13M8 3V6M8 10V13"/>
+                </svg>
+                Tunnels
+            </div>
+            <div class="mobile-menu-item" onclick="mobileShowMetrics()">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 13V8M8 13V3M13 13V6"/>
+                </svg>
+                Metrics
+            </div>
+            <div class="mobile-menu-item" onclick="mobileToggleMenu()">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M4 4L12 12M12 4L4 12"/>
+                </svg>
+                Close
+            </div>
+        </div>
+    </div>
+
     <div class="sidebar">
         <!-- Tunnel Panel -->
         <div class="tunnel-panel" id="tunnel-panel">
@@ -53,7 +93,7 @@
         <!-- Metrics Panel -->
         <div class="metrics-panel" id="metrics-panel">
             <div class="metrics-panel-header" onclick="toggleMetricsPanel()">
-                <span class="metrics-panel-title">📊 Metrics</span>
+                <span class="metrics-panel-title"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 13V8M8 13V3M13 13V6"/></svg> Metrics</span>
                 <span class="chevron" id="metrics-chevron">▼</span>
             </div>
             <div class="metrics-panel-body" id="metrics-body">
@@ -86,7 +126,7 @@
                 <!-- Error Breakdown -->
                 <div class="metrics-subsection" id="error-breakdown" style="display:none;">
                     <div class="metrics-subsection-header" onclick="toggleErrorBreakdown()">
-                        <span>⚠️ Error Breakdown</span>
+                        <span><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2L1.5 13h13L8 2z"/><path d="M8 6v3M8 11v.5"/></svg> Error Breakdown</span>
                         <span class="chevron" id="error-chevron">▼</span>
                     </div>
                     <div class="error-breakdown-body" id="error-breakdown-body">
@@ -163,9 +203,9 @@
             <div class="ws-panel-header">
                 <span>WebSocket Messages</span>
                 <div class="ws-panel-actions">
-                    <button onclick="refreshWSMessages()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">🔄</button>
-                    <button onclick="clearWSMessages()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">🗑️</button>
-                    <button onclick="toggleWSPanel()" style="padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 11px;">✕</button>
+                    <button onclick="refreshWSMessages()" class="ws-panel-btn" title="Refresh"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 8a6 6 0 0 1 10.5-4M14 8a6 6 0 0 1-10.5 4"/><path d="M12 1v4h-4M4 15v-4h4"/></svg></button>
+                    <button onclick="clearWSMessages()" class="ws-panel-btn" title="Clear"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4h10M6 4V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1M5 4v9a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V4"/></svg></button>
+                    <button onclick="toggleWSPanel()" class="ws-panel-btn" title="Close"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
                 </div>
             </div>
             <div id="ws-messages-list" class="ws-messages-list">
@@ -190,7 +230,7 @@
         <div class="modal">
             <div class="modal-header">
                 <h2>New Tunnel</h2>
-                <button class="modal-close" onclick="hideAddTunnelModal()">✕</button>
+                <button class="modal-close" onclick="hideAddTunnelModal()"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
             </div>
             <form onsubmit="submitAddTunnel(event)">
                 <div class="modal-body">
@@ -279,8 +319,8 @@
                             <div class="export-option" onclick="copyAsFetch()">Copy as fetch</div>
                         </div>
                     </div>
-                    <button id="btn-mock" class="btn-mock" onclick="createMockFromRequest()" title="Create mock from this request">🎭</button>
-                    <button id="btn-share" class="btn-share" onclick="shareRequest()" title="Share this request">🔗</button>
+                    <button id="btn-mock" class="btn-mock" onclick="createMockFromRequest()" title="Create mock from this request"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><circle cx="6" cy="7" r="1.5"/><circle cx="10" cy="7" r="1.5"/><path d="M5 10.5c1 1 4 1 6 0"/></svg></button>
+                    <button id="btn-share" class="btn-share" onclick="shareRequest()" title="Share this request"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 10l4-4"/><path d="M9 4.5h2.5v2.5"/><path d="M7 11.5H4.5V9"/></svg></button>
                 </div>
                 <div id="annotation-display" class="annotation-display" style="display: none;"></div>
                 <div id="replay-result" class="replay-result"></div>
