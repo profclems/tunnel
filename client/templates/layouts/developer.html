@@ -228,6 +228,12 @@
                         <div class="form-hint">The local service to forward traffic to</div>
                     </div>
 
+                    <div class="form-group" id="basic-auth-group">
+                        <label class="form-label" for="tunnel-basic-auth">Basic Auth <span style="color: var(--text-muted)">(optional)</span></label>
+                        <input type="text" class="form-input" id="tunnel-basic-auth" placeholder="user:password" autocomplete="off">
+                        <div class="form-hint">Protect tunnel with HTTP Basic Authentication</div>
+                    </div>
+
                     <div class="form-group">
                         <label class="form-checkbox">
                             <input type="checkbox" id="tunnel-persist" checked>

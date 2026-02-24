@@ -3,8 +3,10 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +32,9 @@ type TunnelConfig struct {
 	RemotePort int    `json:"remote_port,omitempty"` // for tcp
 	LocalAddr  string `json:"local_addr"`
 	PublicURL  string `json:"public_url,omitempty"` // assigned by server
+
+	// BasicAuth credentials in "user:password" format (optional, not serialized)
+	BasicAuth string `json:"-"`
 }
 
 // Config holds client configuration
@@ -366,9 +371,9 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 	// Handle based on tunnel type
 	if target.Type == "http" {
 		if c.config.Inspect {
-			c.handleInspectedStream(bufferedReader, remote, target.LocalAddr)
+			c.handleInspectedStream(bufferedReader, remote, target)
 		} else {
-			c.handleHTTPStream(bufferedReader, remote, target.LocalAddr)
+			c.handleHTTPStream(bufferedReader, remote, target)
 		}
 	} else {
 		c.handleTCPStream(bufferedReader, remote, target.LocalAddr)
@@ -377,7 +382,7 @@ func (c *Client) handleStream(ctx context.Context, remote net.Conn) {
 
 // handleHTTPStream handles HTTP tunnel traffic using proper HTTP client/response lifecycle.
 // This avoids the io.Copy goroutine race conditions that caused file truncation.
-func (c *Client) handleHTTPStream(bufferedReader io.Reader, remote net.Conn, localAddr string) {
+func (c *Client) handleHTTPStream(bufferedReader io.Reader, remote net.Conn, target TunnelConfig) {
 	defer remote.Close()
 
 	// Read the incoming HTTP request from the server
@@ -388,9 +393,17 @@ func (c *Client) handleHTTPStream(bufferedReader io.Reader, remote net.Conn, loc
 		return
 	}
 
+	// Check basic auth if configured
+	if !c.checkBasicAuth(req, remote, target.BasicAuth) {
+		return // 401 already sent
+	}
+
+	// Strip auth header before forwarding (don't leak tunnel auth to local service)
+	req.Header.Del("Authorization")
+
 	// Modify request for forwarding to local service
 	req.URL.Scheme = "http"
-	req.URL.Host = localAddr
+	req.URL.Host = target.LocalAddr
 	req.RequestURI = "" // Required for http.Client
 
 	// Create HTTP client for forwarding
@@ -411,7 +424,7 @@ func (c *Client) handleHTTPStream(bufferedReader io.Reader, remote net.Conn, loc
 	// Forward request to local service
 	resp, err := client.Do(req)
 	if err != nil {
-		c.logger.Error("failed to forward request to local service", "error", err, "addr", localAddr)
+		c.logger.Error("failed to forward request to local service", "error", err, "addr", target.LocalAddr)
 		c.writeErrorResponse(remote, http.StatusBadGateway, "Local service unavailable")
 		return
 	}
@@ -438,6 +451,63 @@ func (c *Client) writeErrorResponse(w io.Writer, statusCode int, message string)
 	resp.Header.Set("Content-Type", "text/plain")
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(message)))
 	resp.Write(w)
+}
+
+// checkBasicAuth validates the Authorization header against configured credentials.
+// Returns true if auth is valid or not configured.
+// Returns false and writes 401 response if auth is required but invalid.
+func (c *Client) checkBasicAuth(req *http.Request, conn net.Conn, authConfig string) bool {
+	if authConfig == "" {
+		return true // No auth configured
+	}
+
+	auth := req.Header.Get("Authorization")
+	if auth == "" {
+		c.writeAuthRequired(conn, "")
+		return false
+	}
+
+	// Parse "Basic <base64>"
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		c.writeAuthRequired(conn, "")
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		c.writeAuthRequired(conn, "")
+		return false
+	}
+
+	// Compare credentials using constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare([]byte(authConfig), decoded) != 1 {
+		c.writeAuthRequired(conn, "")
+		return false
+	}
+
+	return true
+}
+
+// writeAuthRequired writes a 401 Unauthorized response with WWW-Authenticate header
+func (c *Client) writeAuthRequired(conn net.Conn, realm string) {
+	if realm == "" {
+		realm = "tunnel"
+	}
+	body := "Unauthorized"
+	resp := &http.Response{
+		StatusCode:    http.StatusUnauthorized,
+		Status:        http.StatusText(http.StatusUnauthorized),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	resp.Header.Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+	resp.Header.Set("Content-Type", "text/plain")
+	resp.Write(conn)
 }
 
 // handleTCPStream handles raw TCP tunnel traffic using bidirectional copy.
@@ -476,10 +546,10 @@ func (c *Client) handleTCPStream(bufferedReader io.Reader, remote net.Conn, loca
 	wg.Wait()
 }
 
-func (c *Client) handleInspectedStream(bufferedReader io.Reader, remote net.Conn, localAddr string) {
+func (c *Client) handleInspectedStream(bufferedReader io.Reader, remote net.Conn, target TunnelConfig) {
 	defer remote.Close()
 
-	c.inspector.SetLocalAddr(localAddr)
+	c.inspector.SetLocalAddr(target.LocalAddr)
 
 	// Read the incoming HTTP request
 	req, err := http.ReadRequest(bufio.NewReader(bufferedReader))
@@ -490,7 +560,11 @@ func (c *Client) handleInspectedStream(bufferedReader io.Reader, remote net.Conn
 	}
 
 	// Use Inspector to handle request/response with recording
-	c.inspector.InspectHTTP(req, remote, localAddr)
+	// Pass auth config so inspector can record auth status
+	c.inspector.InspectHTTPWithOptions(req, remote, InspectHTTPOptions{
+		LocalAddr: target.LocalAddr,
+		BasicAuth: target.BasicAuth,
+	})
 }
 
 // extractSubdomainFromURL extracts the subdomain from a tunnel URL.

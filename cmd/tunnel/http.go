@@ -32,6 +32,9 @@ func newHTTPCmd() *cobra.Command {
 		tlsCertFile     string
 		tlsKeyFile      string
 		tlsCAFile       string
+
+		// Basic auth
+		basicAuth string
 	)
 
 	cmd := &cobra.Command{
@@ -77,6 +80,9 @@ func newHTTPCmd() *cobra.Command {
 			if templatePath == "" {
 				templatePath = viper.GetString("template-path")
 			}
+			if basicAuth == "" {
+				basicAuth = viper.GetString("basic-auth")
+			}
 
 			localPort := args[0]
 			localAddr := localPort
@@ -97,6 +103,7 @@ func newHTTPCmd() *cobra.Command {
 						Type:      "http",
 						Subdomain: subdomain,
 						LocalAddr: localAddr,
+						BasicAuth: basicAuth,
 					},
 				},
 				Inspect:         inspect,
@@ -135,6 +142,7 @@ func newHTTPCmd() *cobra.Command {
 	cmd.Flags().IntVar(&inspectPort, "inspect-port", 4040, "Inspection dashboard port")
 	cmd.Flags().StringVar(&template, "template", "developer", "Dashboard template: only developer available")
 	cmd.Flags().StringVar(&templatePath, "template-path", "", "Path to custom template file (overrides --template)")
+	cmd.Flags().StringVar(&basicAuth, "basic-auth", "", "Basic auth credentials (user:password)")
 
 	// TLS flags
 	cmd.Flags().BoolVar(&tlsEnabled, "tls", false, "Enable TLS for server connection")

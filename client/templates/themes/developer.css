@@ -328,6 +328,13 @@
             flex: 1;
         }
 
+        .tunnel-auth-badge {
+            font-size: 10px;
+            margin-left: 6px;
+            opacity: 0.8;
+            cursor: help;
+        }
+
         .tunnel-actions {
             display: flex;
             gap: 2px;
@@ -1466,6 +1473,20 @@
             font-size: 10px;
             margin-left: 4px;
             opacity: 0.7;
+        }
+
+        .req-auth-icon {
+            font-size: 10px;
+            margin-left: 4px;
+            cursor: help;
+        }
+
+        .req-auth-icon.auth-ok {
+            opacity: 0.6;
+        }
+
+        .req-auth-icon.auth-denied {
+            opacity: 1;
         }
 
         .req-status-dot {

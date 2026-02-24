@@ -1170,6 +1170,15 @@
             url.title = url.textContent;
             mainRow.appendChild(url);
 
+            // Show auth badge if basic auth is enabled
+            if (tunnel.has_basic_auth) {
+                const authBadge = document.createElement('span');
+                authBadge.className = 'tunnel-auth-badge';
+                authBadge.textContent = '🔒';
+                authBadge.title = 'Protected with Basic Auth';
+                mainRow.appendChild(authBadge);
+            }
+
             // Actions
             const actions = document.createElement('div');
             actions.className = 'tunnel-actions';
@@ -1330,6 +1339,7 @@
             document.getElementById('tunnel-subdomain').value = '';
             document.getElementById('tunnel-port').value = '0';
             document.getElementById('tunnel-local').value = '';
+            document.getElementById('tunnel-basic-auth').value = '';
             document.getElementById('tunnel-persist').checked = true;
             document.querySelector('input[name="tunnel-type"][value="http"]').checked = true;
             updateFormFields();
@@ -1347,6 +1357,7 @@
             document.getElementById('type-tcp').classList.toggle('selected', type === 'tcp');
             document.getElementById('subdomain-group').style.display = type === 'http' ? 'block' : 'none';
             document.getElementById('port-group').style.display = type === 'tcp' ? 'block' : 'none';
+            document.getElementById('basic-auth-group').style.display = type === 'http' ? 'block' : 'none';
         }
 
         function updatePreview() {
@@ -1366,10 +1377,17 @@
             const subdomain = document.getElementById('tunnel-subdomain').value.trim();
             const remotePort = parseInt(document.getElementById('tunnel-port').value) || 0;
             const localAddr = document.getElementById('tunnel-local').value.trim();
+            const basicAuth = document.getElementById('tunnel-basic-auth').value.trim();
             const persist = document.getElementById('tunnel-persist').checked;
 
             if (!localAddr) {
                 alert('Local address is required');
+                return;
+            }
+
+            // Validate basic auth format
+            if (basicAuth && !basicAuth.includes(':')) {
+                alert('Basic auth must be in "user:password" format');
                 return;
             }
 
@@ -1380,6 +1398,9 @@
             const body = { type, local_addr: localAddr, persist };
             if (type === 'http') {
                 body.subdomain = subdomain;
+                if (basicAuth) {
+                    body.basic_auth = basicAuth;
+                }
             } else {
                 body.remote_port = remotePort;
             }
@@ -2034,6 +2055,16 @@
                 noteIcon.textContent = '📝';
                 noteIcon.title = hasAnnotation.note || 'Has annotation';
                 path.appendChild(noteIcon);
+            }
+            // Show auth status indicator
+            if (r.auth_required) {
+                const authIcon = document.createElement('span');
+                authIcon.className = 'req-auth-icon ' + (r.authenticated ? 'auth-ok' : 'auth-denied');
+                authIcon.textContent = r.authenticated ? '🔓' : '🔒';
+                authIcon.title = r.authenticated
+                    ? 'Authenticated' + (r.auth_user ? ' as ' + r.auth_user : '')
+                    : 'Auth denied: ' + (r.auth_denied_reason || 'unauthorized');
+                path.appendChild(authIcon);
             }
             main.appendChild(path);
 

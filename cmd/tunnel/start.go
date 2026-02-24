@@ -18,6 +18,7 @@ type TunnelConfigYAML struct {
 	Subdomain  string `mapstructure:"subdomain"`
 	RemotePort int    `mapstructure:"remote_port"`
 	Local      string `mapstructure:"local"`
+	BasicAuth  string `mapstructure:"basic_auth"`
 }
 
 // StartConfigYAML represents the full config file structure for multi-tunnel
@@ -141,6 +142,7 @@ Usage:
 					Subdomain:  t.Subdomain,
 					RemotePort: t.RemotePort,
 					LocalAddr:  t.Local,
+					BasicAuth:  t.BasicAuth,
 				})
 			}
 

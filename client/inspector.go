@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,12 @@ type RequestRecord struct {
 	ResBodySize int64  `json:"res_body_size"` // Response body size in bytes
 	ContentType string `json:"content_type"`  // Response content type for syntax highlighting
 	TunnelID    string `json:"tunnel_id"`     // Which tunnel this request came through
+
+	// Basic auth status
+	AuthRequired     bool   `json:"auth_required"`                // Whether basic auth is configured for this tunnel
+	Authenticated    bool   `json:"authenticated"`                // Whether the request was authenticated
+	AuthUser         string `json:"auth_user"`                    // Username from auth (if authenticated)
+	AuthDeniedReason string `json:"auth_denied_reason,omitempty"` // Reason for auth denial
 }
 
 // LatencyPoint represents a single latency measurement for graphing
@@ -693,10 +700,60 @@ func (i *Inspector) SearchRequests(method, path, bodySearch string, statusFrom, 
 	return results
 }
 
+// InspectHTTPOptions holds options for HTTP inspection
+type InspectHTTPOptions struct {
+	LocalAddr string
+	BasicAuth string // "user:password" format, empty if not configured
+}
+
+// validateBasicAuth validates the Authorization header against configured credentials.
+// Returns (valid, username, reason) where reason explains why auth failed.
+func (i *Inspector) validateBasicAuth(req *http.Request, authConfig string) (bool, string, string) {
+	if authConfig == "" {
+		return true, "", ""
+	}
+
+	auth := req.Header.Get("Authorization")
+	if auth == "" {
+		return false, "", "no credentials provided"
+	}
+
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		return false, "", "invalid auth scheme"
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return false, "", "invalid base64 encoding"
+	}
+
+	// Extract username from credentials
+	creds := string(decoded)
+	parts := strings.SplitN(creds, ":", 2)
+	username := ""
+	if len(parts) > 0 {
+		username = parts[0]
+	}
+
+	// Compare credentials (we use subtle compare in the main client code,
+	// but here we're just recording - the actual validation happens in client.go)
+	if creds != authConfig {
+		return false, username, "invalid credentials"
+	}
+
+	return true, username, ""
+}
+
 // InspectHTTP handles an HTTP request with inspection, forwarding to local service
 // and writing the response back to the stream. This is the proper HTTP-aware version
 // that avoids the io.Copy goroutine race conditions.
 func (i *Inspector) InspectHTTP(req *http.Request, stream net.Conn, localAddr string) {
+	i.InspectHTTPWithOptions(req, stream, InspectHTTPOptions{LocalAddr: localAddr})
+}
+
+// InspectHTTPWithOptions handles an HTTP request with inspection and auth support.
+func (i *Inspector) InspectHTTPWithOptions(req *http.Request, stream net.Conn, opts InspectHTTPOptions) {
 	start := time.Now()
 	id := uuid.NewString()
 
@@ -723,17 +780,66 @@ func (i *Inspector) InspectHTTP(req *http.Request, stream net.Conn, localAddr st
 	}
 
 	rec := &RequestRecord{
-		ID:          id,
-		Method:      req.Method,
-		Path:        req.URL.Path,
-		Host:        req.Host,
-		URL:         urlStr,
-		Timestamp:   start,
-		ReqHeader:   req.Header.Clone(),
-		ReqBody:     reqBody,
-		ReqBodySize: int64(len(reqBodyBytes)),
-		TunnelID:    tunnelID,
+		ID:           id,
+		Method:       req.Method,
+		Path:         req.URL.Path,
+		Host:         req.Host,
+		URL:          urlStr,
+		Timestamp:    start,
+		ReqHeader:    req.Header.Clone(),
+		ReqBody:      reqBody,
+		ReqBodySize:  int64(len(reqBodyBytes)),
+		TunnelID:     tunnelID,
+		AuthRequired: opts.BasicAuth != "",
 	}
+
+	// Check basic auth if configured
+	if opts.BasicAuth != "" {
+		authValid, authUser, authReason := i.validateBasicAuth(req, opts.BasicAuth)
+		rec.Authenticated = authValid
+		rec.AuthUser = authUser
+		rec.AuthDeniedReason = authReason
+
+		if !authValid {
+			// Record the failed auth attempt
+			duration := time.Since(start)
+			rec.Status = http.StatusUnauthorized
+			rec.Duration = duration.String()
+			rec.DurationMs = duration.Milliseconds()
+			rec.ResBody = "Unauthorized"
+			rec.ResBodySize = int64(len("Unauthorized"))
+			rec.ResHeader = http.Header{
+				"WWW-Authenticate": []string{`Basic realm="tunnel"`},
+				"Content-Type":     []string{"text/plain"},
+			}
+
+			i.addRecord(rec)
+			i.recordMetrics(rec)
+
+			// Broadcast to SSE clients
+			select {
+			case i.broadcast <- rec:
+			default:
+			}
+
+			// Send 401 response
+			resp := &http.Response{
+				StatusCode:    http.StatusUnauthorized,
+				Status:        http.StatusText(http.StatusUnauthorized),
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        rec.ResHeader,
+				Body:          io.NopCloser(strings.NewReader("Unauthorized")),
+				ContentLength: int64(len("Unauthorized")),
+			}
+			resp.Write(stream)
+			return
+		}
+	}
+
+	// Strip Authorization header before forwarding (don't leak to local service)
+	req.Header.Del("Authorization")
 
 	// Check for matching mock rule FIRST
 	if mock := i.findMatchingMock(req.Method, req.URL.Path); mock != nil {
@@ -743,7 +849,7 @@ func (i *Inspector) InspectHTTP(req *http.Request, stream net.Conn, localAddr st
 
 	// Modify request for forwarding to local service
 	req.URL.Scheme = "http"
-	req.URL.Host = localAddr
+	req.URL.Host = opts.LocalAddr
 	req.RequestURI = "" // Required for http.Client
 
 	// Create HTTP client for forwarding
@@ -1038,12 +1144,24 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		if i.client == nil {
-			json.NewEncoder(w).Encode([]TunnelConfig{})
+			json.NewEncoder(w).Encode([]map[string]interface{}{})
 			return
 		}
 
 		tunnels := i.client.GetTunnels()
-		json.NewEncoder(w).Encode(tunnels)
+		// Convert to response format with HasBasicAuth flag (don't expose credentials)
+		response := make([]map[string]interface{}, len(tunnels))
+		for idx, t := range tunnels {
+			response[idx] = map[string]interface{}{
+				"type":           t.Type,
+				"subdomain":      t.Subdomain,
+				"remote_port":    t.RemotePort,
+				"local_addr":     t.LocalAddr,
+				"public_url":     t.PublicURL,
+				"has_basic_auth": t.BasicAuth != "",
+			}
+		}
+		json.NewEncoder(w).Encode(response)
 	})
 
 	mux.HandleFunc("/api/tunnels/add", func(w http.ResponseWriter, r *http.Request) {
@@ -1074,6 +1192,7 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 			Subdomain  string `json:"subdomain,omitempty"`
 			RemotePort int    `json:"remote_port,omitempty"`
 			LocalAddr  string `json:"local_addr"`
+			BasicAuth  string `json:"basic_auth,omitempty"` // "user:password" format
 			Persist    bool   `json:"persist"`
 		}
 
@@ -1102,11 +1221,19 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 			return
 		}
 
+		// Validate basic auth format if provided
+		if req.BasicAuth != "" && !strings.Contains(req.BasicAuth, ":") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Basic auth must be in 'user:password' format"})
+			return
+		}
+
 		tunnel := TunnelConfig{
 			Type:       req.Type,
 			Subdomain:  req.Subdomain,
 			RemotePort: req.RemotePort,
 			LocalAddr:  req.LocalAddr,
+			BasicAuth:  req.BasicAuth,
 		}
 
 		resp, err := i.client.AddTunnel(tunnel)
@@ -1129,6 +1256,7 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 				Subdomain:  req.Subdomain,
 				RemotePort: req.RemotePort,
 				Local:      req.LocalAddr,
+				BasicAuth:  req.BasicAuth,
 			}
 			// Update with assigned values
 			if req.Type == "http" && req.Subdomain == "" && resp.URL != "" {

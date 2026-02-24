@@ -37,6 +37,7 @@ type TunnelEntry struct {
 	Subdomain  string `yaml:"subdomain,omitempty"`
 	RemotePort int    `yaml:"remote_port,omitempty"`
 	Local      string `yaml:"local"`
+	BasicAuth  string `yaml:"basic_auth,omitempty"` // "user:password" format
 }
 
 // NewConfigManager creates a config manager
