@@ -8,7 +8,7 @@ import (
 func TestGenerateSubdomain(t *testing.T) {
 	// Test that generated subdomains are unique
 	seen := make(map[string]bool)
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		subdomain := generateSubdomain()
 
 		// Check length (8 chars from 5 bytes base32)
@@ -30,7 +30,7 @@ func TestGenerateSubdomain(t *testing.T) {
 }
 
 func TestGenerateSubdomain_DNSCompatible(t *testing.T) {
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		subdomain := generateSubdomain()
 
 		// Check it only contains valid DNS label characters (alphanumeric)

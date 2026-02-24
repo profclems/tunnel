@@ -73,7 +73,7 @@ type Client struct {
 
 	// Pending requests for async responses
 	pendingMu sync.Mutex
-	pending   map[string]chan interface{}
+	pending   map[string]chan any
 
 	// Config manager for persistence
 	configMgr *ConfigManager
@@ -84,7 +84,7 @@ func NewClient(cfg Config, logger *slog.Logger) *Client {
 	c := &Client{
 		config:  cfg,
 		logger:  logger,
-		pending: make(map[string]chan interface{}),
+		pending: make(map[string]chan any),
 	}
 	if cfg.Inspect {
 		var opts []InspectorOption
@@ -581,8 +581,8 @@ func extractSubdomainFromURL(rawURL string) string {
 	}
 
 	hostname := parsed.Hostname()
-	if idx := strings.Index(hostname, "."); idx != -1 {
-		return hostname[:idx]
+	if before, _, ok := strings.Cut(hostname, "."); ok {
+		return before
 	}
 	return ""
 }
@@ -623,7 +623,7 @@ func (c *Client) handleControlResponses(ctlStream net.Conn) {
 	}
 }
 
-func (c *Client) handlePendingResponse(requestID string, resp interface{}) {
+func (c *Client) handlePendingResponse(requestID string, resp any) {
 	c.pendingMu.Lock()
 	ch, ok := c.pending[requestID]
 	if ok {
@@ -653,7 +653,7 @@ func (c *Client) AddTunnel(t TunnelConfig) (*protocol.TunnelAddResponse, error) 
 	}
 
 	// Create response channel
-	respCh := make(chan interface{}, 1)
+	respCh := make(chan any, 1)
 	c.pendingMu.Lock()
 	c.pending[requestID] = respCh
 	c.pendingMu.Unlock()
@@ -723,7 +723,7 @@ func (c *Client) RemoveTunnel(tunnelType, subdomain string, port int) (*protocol
 	}
 
 	// Create response channel
-	respCh := make(chan interface{}, 1)
+	respCh := make(chan any, 1)
 	c.pendingMu.Lock()
 	c.pending[requestID] = respCh
 	c.pendingMu.Unlock()

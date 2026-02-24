@@ -98,7 +98,7 @@ func (m *Metrics) GetStats() MetricsResponse {
 		Subdomains:       make(map[string]SubdomainStats),
 	}
 
-	m.subdomainMetrics.Range(func(key, value interface{}) bool {
+	m.subdomainMetrics.Range(func(key, value any) bool {
 		subdomain := key.(string)
 		sm := value.(*SubdomainMetrics)
 		resp.Subdomains[subdomain] = SubdomainStats{
@@ -174,7 +174,7 @@ func (m *Metrics) writePrometheusMetrics(w http.ResponseWriter) {
 	// Per-subdomain metrics
 	fmt.Fprintf(w, "# HELP tunnel_subdomain_requests_total Requests per subdomain\n")
 	fmt.Fprintf(w, "# TYPE tunnel_subdomain_requests_total counter\n")
-	m.subdomainMetrics.Range(func(key, value interface{}) bool {
+	m.subdomainMetrics.Range(func(key, value any) bool {
 		subdomain := key.(string)
 		sm := value.(*SubdomainMetrics)
 		fmt.Fprintf(w, "tunnel_subdomain_requests_total{subdomain=\"%s\"} %d\n", subdomain, sm.Requests.Load())
@@ -184,7 +184,7 @@ func (m *Metrics) writePrometheusMetrics(w http.ResponseWriter) {
 
 	fmt.Fprintf(w, "# HELP tunnel_subdomain_bytes_in_total Bytes received per subdomain\n")
 	fmt.Fprintf(w, "# TYPE tunnel_subdomain_bytes_in_total counter\n")
-	m.subdomainMetrics.Range(func(key, value interface{}) bool {
+	m.subdomainMetrics.Range(func(key, value any) bool {
 		subdomain := key.(string)
 		sm := value.(*SubdomainMetrics)
 		fmt.Fprintf(w, "tunnel_subdomain_bytes_in_total{subdomain=\"%s\"} %d\n", subdomain, sm.BytesIn.Load())
@@ -194,7 +194,7 @@ func (m *Metrics) writePrometheusMetrics(w http.ResponseWriter) {
 
 	fmt.Fprintf(w, "# HELP tunnel_subdomain_bytes_out_total Bytes sent per subdomain\n")
 	fmt.Fprintf(w, "# TYPE tunnel_subdomain_bytes_out_total counter\n")
-	m.subdomainMetrics.Range(func(key, value interface{}) bool {
+	m.subdomainMetrics.Range(func(key, value any) bool {
 		subdomain := key.(string)
 		sm := value.(*SubdomainMetrics)
 		fmt.Fprintf(w, "tunnel_subdomain_bytes_out_total{subdomain=\"%s\"} %d\n", subdomain, sm.BytesOut.Load())

@@ -10,7 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -584,7 +584,7 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 	// Build rate history (last 60 seconds)
 	now := time.Now().Unix()
 	rateHistory := make([]int, 60)
-	for j := 0; j < 60; j++ {
+	for j := range 60 {
 		sec := now - int64(59-j)
 		rateHistory[j] = i.metrics.rateBuckets[sec]
 	}
@@ -615,7 +615,7 @@ func (i *Inspector) GetMetricsSnapshot() MetricsSnapshot {
 		avgLatency = total / int64(len(latency))
 
 		// Sort for percentile calculation
-		sort.Slice(sorted, func(a, b int) bool { return sorted[a] < sorted[b] })
+		slices.Sort(sorted)
 
 		// Calculate percentiles
 		n := len(sorted)
@@ -1144,15 +1144,15 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		if i.client == nil {
-			json.NewEncoder(w).Encode([]map[string]interface{}{})
+			json.NewEncoder(w).Encode([]map[string]any{})
 			return
 		}
 
 		tunnels := i.client.GetTunnels()
 		// Convert to response format with HasBasicAuth flag (don't expose credentials)
-		response := make([]map[string]interface{}, len(tunnels))
+		response := make([]map[string]any, len(tunnels))
 		for idx, t := range tunnels {
-			response[idx] = map[string]interface{}{
+			response[idx] = map[string]any{
 				"type":           t.Type,
 				"subdomain":      t.Subdomain,
 				"remote_port":    t.RemotePort,
@@ -1400,7 +1400,7 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 
 		if err != nil {
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"error":       err.Error(),
 				"duration_ms": duration.Milliseconds(),
 			})
@@ -1412,7 +1412,7 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // Limit to 1MB
 
 		// Return result
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":       resp.StatusCode,
 			"status_text":  resp.Status,
 			"headers":      resp.Header,
@@ -1434,46 +1434,46 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 		i.mu.RUnlock()
 
 		// Build HAR format
-		entries := make([]map[string]interface{}, 0, len(requests))
+		entries := make([]map[string]any, 0, len(requests))
 		for _, req := range requests {
-			entry := map[string]interface{}{
+			entry := map[string]any{
 				"startedDateTime": req.Timestamp.Format(time.RFC3339),
 				"time":            req.DurationMs,
-				"request": map[string]interface{}{
+				"request": map[string]any{
 					"method":      req.Method,
 					"url":         req.URL,
 					"httpVersion": "HTTP/1.1",
 					"headers":     headersToHAR(req.ReqHeader),
-					"queryString": []interface{}{},
+					"queryString": []any{},
 					"bodySize":    req.ReqBodySize,
-					"postData": map[string]interface{}{
+					"postData": map[string]any{
 						"mimeType": req.ReqHeader.Get("Content-Type"),
 						"text":     req.ReqBody,
 					},
 				},
-				"response": map[string]interface{}{
+				"response": map[string]any{
 					"status":      req.Status,
 					"statusText":  http.StatusText(req.Status),
 					"httpVersion": "HTTP/1.1",
 					"headers":     headersToHAR(req.ResHeader),
-					"content": map[string]interface{}{
+					"content": map[string]any{
 						"size":     req.ResBodySize,
 						"mimeType": req.ContentType,
 						"text":     req.ResBody,
 					},
 					"bodySize": req.ResBodySize,
 				},
-				"timings": map[string]interface{}{
+				"timings": map[string]any{
 					"wait": req.DurationMs,
 				},
 			}
 			entries = append(entries, entry)
 		}
 
-		har := map[string]interface{}{
-			"log": map[string]interface{}{
+		har := map[string]any{
+			"log": map[string]any{
 				"version": "1.2",
-				"creator": map[string]interface{}{
+				"creator": map[string]any{
 					"name":    "Tunnel Inspector",
 					"version": "1.0",
 				},
@@ -1746,7 +1746,7 @@ func (i *Inspector) ServeDashboard(ctx context.Context, port int) {
 	mux.HandleFunc("/api/template", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"template":  i.template,
 			"available": templates.AvailableTemplates,
 		})

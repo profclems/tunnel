@@ -85,7 +85,7 @@ type TunnelRemoveResponse struct {
 }
 
 // WriteMessage sends a JSON control message
-func WriteMessage(w io.Writer, msgType MessageType, payload interface{}) error {
+func WriteMessage(w io.Writer, msgType MessageType, payload any) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)

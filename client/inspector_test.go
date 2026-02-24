@@ -57,7 +57,7 @@ func TestInspector_GetRecent_Order(t *testing.T) {
 	inspector := NewInspector()
 
 	// Add multiple records
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		rec := &RequestRecord{
 			ID:        string(rune('a' + i)),
 			Method:    "GET",
@@ -83,7 +83,7 @@ func TestInspector_MaxSize(t *testing.T) {
 	inspector.maxSize = 5 // Reduce for testing
 
 	// Add more records than maxSize
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		rec := &RequestRecord{
 			ID:        string(rune('a' + i)),
 			Method:    "GET",

@@ -10,7 +10,7 @@ func TestWriteMessage(t *testing.T) {
 	tests := []struct {
 		name    string
 		msgType MessageType
-		payload interface{}
+		payload any
 	}{
 		{
 			name:    "auth request with http tunnel",

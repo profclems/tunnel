@@ -2,6 +2,7 @@ package templates
 
 import (
 	"embed"
+	"slices"
 )
 
 //go:embed base.js
@@ -21,10 +22,5 @@ var AvailableTemplates = []string{
 
 // IsValidTemplate checks if a template name is valid
 func IsValidTemplate(name string) bool {
-	for _, t := range AvailableTemplates {
-		if t == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(AvailableTemplates, name)
 }
