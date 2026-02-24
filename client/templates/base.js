@@ -73,7 +73,14 @@
             qr: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="10" y="10" width="3" height="3"/></svg>',
             bolt: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2L4 9h4l-1 5 5-7H8l1-5z"/></svg>',
             terminal: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 5l3 3-3 3M8 11h4"/></svg>',
-            external: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 9v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h4"/><path d="M9 2h5v5M7 9l6-6"/></svg>'
+            external: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 9v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h4"/><path d="M9 2h5v5M7 9l6-6"/></svg>',
+            arrowDown: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v10M4 9l4 4 4-4"/></svg>',
+            arrowUp: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M4 7l4-4 4 4"/></svg>',
+            moon: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 10.5A6 6 0 1 1 5.5 2a5 5 0 0 0 8.5 8.5z"/></svg>',
+            sun: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5L13 13M3 13l1.5-1.5M11.5 4.5L13 3"/></svg>',
+            pin: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 2L5 6l1.5 1.5-4 4L4 13l4-4L9.5 10.5l4-4L9 2z"/></svg>',
+            play: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4 3l9 5-9 5V3z"/></svg>',
+            pause: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 3v10M11 3v10"/></svg>'
         };
 
         function icon(name, size) {
@@ -358,6 +365,9 @@
                     container.appendChild(createRequestItem(req));
                 });
             }
+
+            // Initialize Lucide icons for dynamically added elements
+            if (typeof lucide !== 'undefined') lucide.createIcons();
         }
 
         function renderGroupedRequests(container) {
@@ -486,7 +496,7 @@
             // Show newest first
             const reversed = [...wsMessages].reverse();
             reversed.forEach(msg => {
-                const dirIcon = msg.direction === 'in' ? '⬇️' : '⬆️';
+                const dirIcon = msg.direction === 'in' ? icon('arrowDown') : icon('arrowUp');
                 const dirClass = msg.direction;
                 const time = new Date(msg.timestamp).toLocaleTimeString();
                 const dataPreview = msg.data.length > 80 ? msg.data.substring(0, 80) + '...' : msg.data;
@@ -518,7 +528,7 @@
             modal.innerHTML = `
                 <div class="modal-content" style="width: 600px; max-height: 80vh;">
                     <div class="modal-header">
-                        <h3>${msg.direction === 'in' ? '⬇️ Incoming' : '⬆️ Outgoing'} Message</h3>
+                        <h3>${msg.direction === 'in' ? icon('arrowDown') + ' Incoming' : icon('arrowUp') + ' Outgoing'} Message</h3>
                         <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
                     </div>
                     <div class="modal-body" style="overflow: auto;">
@@ -1636,7 +1646,7 @@
                 new Notification('Request Error', {
                     body: req.method + ' ' + req.path + ' → ' + req.status,
                     tag: req.id,
-                    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">⚠️</text></svg>'
+                    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23f85149" stroke-width="2"><path d="M12 2L2 20h20L12 2z"/><path d="M12 9v4M12 17v.5"/></svg>'
                 });
             }
         }
@@ -1677,14 +1687,15 @@
 
             if (isPaused) {
                 btn.classList.add('paused');
-                icon.textContent = '▶';
+                icon.outerHTML = '<i data-lucide="play" id="pause-icon" class="lucide-sm"></i>';
                 btn.title = 'Resume live updates (Space)';
             } else {
                 btn.classList.remove('paused');
-                icon.textContent = '⏸';
+                icon.outerHTML = '<i data-lucide="pause" id="pause-icon" class="lucide-sm"></i>';
                 btn.title = 'Pause live updates (Space)';
                 badge.style.display = 'none';
             }
+            if (typeof lucide !== 'undefined') lucide.createIcons();
         }
 
         function updatePauseBadge(count) {
@@ -1708,8 +1719,13 @@
 
         function applyTheme() {
             document.documentElement.classList.toggle('light-theme', theme === 'light');
-            const icon = $('theme-icon');
-            if (icon) icon.textContent = theme === 'dark' ? '🌙' : '☀️';
+            const themeIcon = $('theme-icon');
+            if (themeIcon) {
+                themeIcon.outerHTML = theme === 'dark'
+                    ? '<i data-lucide="moon" id="theme-icon" class="lucide-sm"></i>'
+                    : '<i data-lucide="sun" id="theme-icon" class="lucide-sm"></i>';
+                if (typeof lucide !== 'undefined') lucide.createIcons();
+            }
         }
 
         // ===== KEYBOARD SHORTCUTS =====
@@ -2061,7 +2077,7 @@
 
             const pinBtn = document.createElement('button');
             pinBtn.className = 'req-pin-btn' + (isPinned ? ' pinned' : '');
-            pinBtn.textContent = '📌';
+            pinBtn.innerHTML = '<i data-lucide="pin" class="lucide-sm"></i>';
             pinBtn.title = isPinned ? 'Unpin request' : 'Pin request';
             pinBtn.onclick = (e) => {
                 e.stopPropagation();
@@ -2437,7 +2453,8 @@
             .then(r => r.json())
             .then(data => {
                 btn.disabled = false;
-                btn.innerHTML = icon('link');
+                btn.innerHTML = '<i data-lucide="share-2" class="lucide-sm"></i>';
+                if (typeof lucide !== 'undefined') lucide.createIcons();
 
                 if (data.error) {
                     showCopyToast('Error: ' + data.error);
@@ -2449,7 +2466,8 @@
             })
             .catch(err => {
                 btn.disabled = false;
-                btn.innerHTML = icon('link');
+                btn.innerHTML = '<i data-lucide="share-2" class="lucide-sm"></i>';
+                if (typeof lucide !== 'undefined') lucide.createIcons();
                 showCopyToast('Error: ' + err.message);
             });
         }
@@ -2668,6 +2686,11 @@
         initSSE();
         fetchMetrics();
         applyTheme();
+
+        // Initialize Lucide icons
+        if (typeof lucide !== 'undefined') {
+            lucide.createIcons();
+        }
 
         // Update connection tooltip every 5 seconds
         setInterval(function() {

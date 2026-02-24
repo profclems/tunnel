@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tunnel Inspector</title>
     <link rel="stylesheet" href="/static/theme.css">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
     <!-- Mobile Navigation Header (hidden on desktop) -->
@@ -137,7 +138,7 @@
                 <!-- Latency Histogram -->
                 <div class="metrics-subsection">
                     <div class="metrics-subsection-header" onclick="toggleHistogram()">
-                        <span>📈 Response Time Distribution</span>
+                        <span><i data-lucide="trending-up" class="lucide-sm"></i> Response Time Distribution</span>
                         <span class="chevron" id="histogram-chevron">▶</span>
                     </div>
                     <div class="histogram-body collapsed" id="histogram-body">
@@ -152,19 +153,19 @@
             <h1>Traffic</h1>
             <div class="traffic-header-actions">
                 <button class="btn-theme" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme">
-                    <span id="theme-icon">🌙</span>
+                    <i data-lucide="moon" id="theme-icon" class="lucide-sm"></i>
                 </button>
                 <button class="btn-export-har" onclick="exportHAR()" title="Export as HAR file">
-                    <span>📥</span>
+                    <i data-lucide="download" class="lucide-sm"></i>
                 </button>
                 <button class="btn-notify" id="btn-notify" onclick="toggleNotifications()" title="Enable desktop notifications for errors">
-                    <span class="notify-icon">🔔</span>
+                    <i data-lucide="bell" class="lucide-sm notify-icon"></i>
                 </button>
                 <button class="btn-pause" id="btn-pause" onclick="togglePause()" title="Pause/resume live updates (Space)">
-                    <span id="pause-icon">⏸</span><span id="pause-badge" class="pause-badge" style="display:none">0</span>
+                    <i data-lucide="pause" id="pause-icon" class="lucide-sm"></i><span id="pause-badge" class="pause-badge" style="display:none">0</span>
                 </button>
-                <span id="pinned-count" class="pinned-count" style="display:none" title="Pinned requests">📌 <span id="pinned-num">0</span></span>
-                <button class="btn-clear-session" id="btn-clear-session" onclick="clearSession()" title="Clear session data" style="display:none">🗑️</button>
+                <span id="pinned-count" class="pinned-count" style="display:none" title="Pinned requests"><i data-lucide="pin" class="lucide-sm"></i> <span id="pinned-num">0</span></span>
+                <button class="btn-clear-session" id="btn-clear-session" onclick="clearSession()" title="Clear session data" style="display:none"><i data-lucide="trash-2" class="lucide-sm"></i></button>
                 <div class="traffic-live-badge" id="traffic-badge">
                     <div class="traffic-live-dot"></div>
                     <span>Live</span>
@@ -191,10 +192,10 @@
                 <option value="5xx">5xx Server Error</option>
             </select>
             <button class="btn-group-toggle" id="btn-group-toggle" onclick="toggleGrouping()" title="Group requests by path">
-                <span id="group-icon">📁</span>
+                <i data-lucide="folder" id="group-icon" class="lucide-sm"></i>
             </button>
             <button class="btn-ws-toggle" id="btn-ws-toggle" onclick="toggleWSPanel()" title="WebSocket Messages">
-                🔌 WS <span id="ws-count" class="ws-count">0</span>
+                <i data-lucide="plug" class="lucide-sm"></i> WS <span id="ws-count" class="ws-count">0</span>
             </button>
         </div>
 
@@ -296,7 +297,7 @@
     <!-- Main Content -->
     <div class="main">
         <div id="empty-state" class="empty-state">
-            <div class="empty-state-icon">📡</div>
+            <div class="empty-state-icon"><i data-lucide="radio" class="lucide-lg"></i></div>
             <div>Select a request to inspect details</div>
         </div>
 
@@ -311,7 +312,7 @@
                     <span id="d-time">12:00:00</span>
                     <span id="d-duration">120ms</span>
                     <button id="btn-replay" class="btn-replay" onclick="replayRequest()">▶ Replay</button>
-                    <button id="btn-annotate" class="btn-annotate" onclick="showAnnotationModal(selectedId)" title="Add note/tags">📝</button>
+                    <button id="btn-annotate" class="btn-annotate" onclick="showAnnotationModal(selectedId)" title="Add note/tags"><i data-lucide="file-text" class="lucide-sm"></i></button>
                     <div class="export-dropdown">
                         <button class="btn-export" onclick="toggleExportMenu()">⤓ Export</button>
                         <div class="export-menu" id="export-menu">
@@ -319,8 +320,8 @@
                             <div class="export-option" onclick="copyAsFetch()">Copy as fetch</div>
                         </div>
                     </div>
-                    <button id="btn-mock" class="btn-mock" onclick="createMockFromRequest()" title="Create mock from this request"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><circle cx="6" cy="7" r="1.5"/><circle cx="10" cy="7" r="1.5"/><path d="M5 10.5c1 1 4 1 6 0"/></svg></button>
-                    <button id="btn-share" class="btn-share" onclick="shareRequest()" title="Share this request"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 10l4-4"/><path d="M9 4.5h2.5v2.5"/><path d="M7 11.5H4.5V9"/></svg></button>
+                    <button id="btn-mock" class="btn-mock" onclick="createMockFromRequest()" title="Create mock from this request"><i data-lucide="drama" class="lucide-sm"></i></button>
+                    <button id="btn-share" class="btn-share" onclick="shareRequest()" title="Share this request"><i data-lucide="share-2" class="lucide-sm"></i></button>
                 </div>
                 <div id="annotation-display" class="annotation-display" style="display: none;"></div>
                 <div id="replay-result" class="replay-result"></div>
@@ -407,8 +408,8 @@
                     <select id="webhook-template-select" class="webhook-method" style="flex: 1;" onchange="loadTemplate(this.value)" aria-label="Select template">
                         <option value="">-- Templates --</option>
                     </select>
-                    <button onclick="saveAsTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;">💾 Save</button>
-                    <button onclick="deleteTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;">🗑️</button>
+                    <button onclick="saveAsTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;"><i data-lucide="save" class="lucide-sm"></i> Save</button>
+                    <button onclick="deleteTemplate()" style="padding: 6px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); cursor: pointer; font-size: 12px;"><i data-lucide="trash-2" class="lucide-sm"></i></button>
                 </div>
                 <div class="webhook-row">
                     <select id="webhook-method" class="webhook-method" aria-label="HTTP method">

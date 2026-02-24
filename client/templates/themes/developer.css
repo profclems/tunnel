@@ -46,6 +46,50 @@
             display: block;
         }
 
+        /* Lucide icon sizes and colors */
+        .lucide-sm {
+            width: 14px;
+            height: 14px;
+        }
+
+        .lucide-md {
+            width: 18px;
+            height: 18px;
+        }
+
+        .lucide-lg {
+            width: 32px;
+            height: 32px;
+        }
+
+        [data-lucide] {
+            display: inline-block;
+            vertical-align: middle;
+            color: inherit;
+        }
+
+        [data-lucide] svg {
+            stroke: currentColor;
+            color: inherit;
+        }
+
+        /* Ensure buttons with icons have proper color inheritance */
+        button [data-lucide],
+        .btn-theme [data-lucide],
+        .btn-export-har [data-lucide],
+        .btn-notify [data-lucide],
+        .btn-pause [data-lucide],
+        .btn-mock [data-lucide],
+        .btn-share [data-lucide],
+        .btn-annotate [data-lucide],
+        .req-pin-btn [data-lucide] {
+            color: var(--text-main);
+        }
+
+        button:hover [data-lucide] {
+            color: var(--primary);
+        }
+
         /* Layout */
         .sidebar {
             width: 420px;
